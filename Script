@@ -1,0 +1,3015 @@
+--[[
+    Beg a Baddies Hub (Luau) - v11
+    NOVO nesta versão:
+      * Beg: o X da conversa agora só é apertado quando o PERSONAGEM SOME (coletado ou foi embora).
+        Antes ele ficava apertando o X logo depois da conversa. Detecta: modelo removido do mapa,
+        ficou invisível ou se afastou muito. Config. Autofarm > Conversa e Beg.
+
+    Da v10: voo nativo (modo/velocidade em Config. Autofarm > Movimento).
+    Da v9: Raid e Fendas pelo menu Viagem, botão quadrado que oculta/mostra o Hub, Hub fixável.
+    Das anteriores: Config. Autofarm em sub-abas, raridades fixas do Index, lista de bloqueio, Upgrade de
+    níveis, Auto Resgatar, Auto Buy Auras, loja de poções, Beg perfeito, Auto Talk.
+
+    Nenhum nome de Remote do jogo foi inventado. Caminhos vazios por padrão.
+]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+local VIM = game:GetService("VirtualInputManager")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local GuiService = game:GetService("GuiService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+local env = (getgenv and getgenv()) or _G
+if env.BegABaddiesHub then pcall(env.BegABaddiesHub.Destroy) end
+local Hub = { Destroyed = false, Cleanup = {} }
+env.BegABaddiesHub = Hub
+
+local function connect(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(Hub.Cleanup, c)
+	return c
+end
+
+--==================================================================
+-- Interface/Theme
+--==================================================================
+local Theme = {
+	Bg = Color3.fromRGB(16, 10, 28),
+	Panel = Color3.fromRGB(26, 17, 46),
+	Side = Color3.fromRGB(21, 13, 38),
+	Card = Color3.fromRGB(40, 27, 68),
+	Accent = Color3.fromRGB(139, 92, 246),
+	Accent2 = Color3.fromRGB(196, 167, 255),
+	Text = Color3.fromRGB(240, 232, 255),
+	Sub = Color3.fromRGB(165, 148, 196),
+	Off = Color3.fromRGB(72, 56, 104),
+	Warn = Color3.fromRGB(255, 200, 120),
+	Error = Color3.fromRGB(255, 120, 160),
+	Font = Enum.Font.GothamMedium,
+	FontBold = Enum.Font.GothamBold,
+}
+
+local function create(class, props, children)
+	local o = Instance.new(class)
+	local parent
+	for k, v in pairs(props or {}) do
+		if k == "Parent" then parent = v else o[k] = v end
+	end
+	for _, c in ipairs(children or {}) do c.Parent = o end
+	if parent then o.Parent = parent end
+	return o
+end
+local function round(r) return create("UICorner", { CornerRadius = UDim.new(0, r) }) end
+local function stroke(color, thickness, transparency)
+	return create("UIStroke", {
+		Color = color, Thickness = thickness or 1, Transparency = transparency or 0.5,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+end
+local function tween(o, t, props)
+	TweenService:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+--==================================================================
+-- Settings/Toggles
+--==================================================================
+local Toggles = { State = { master = true, notifications = true, moveto = true, rarest = true }, Listeners = {} }
+Toggles.Event = Instance.new("BindableEvent")
+function Toggles.Get(id) return Toggles.State[id] == true end
+function Toggles.Active(id) return Toggles.State.master == true and Toggles.State[id] == true end
+function Toggles.Listen(fn) table.insert(Toggles.Listeners, fn) end
+function Toggles.Set(id, v)
+	Toggles.State[id] = v and true or false
+	for _, fn in ipairs(Toggles.Listeners) do pcall(fn, id) end
+	Toggles.Event:Fire()
+end
+
+--==================================================================
+-- Settings/Configuration
+--==================================================================
+local FILE = "BegABaddiesHub.json"
+local Configuration = {
+	Speed = 1,
+	Intervals = {},
+	Keywords = {
+		MissionCollect = { "mission", "quest", "missão", "missao", "collect", "claim", "coletar", "resgatar" },
+		Talk = { "beg", "talk", "chat", "speak", "conversar", "falar", "pedir", "interagir", "interact" },
+		Buddy = { "buddy", "buddies" },
+		Raid = { "raid", "incurs", "invas", "invad" },
+		Rift = { "rift", "fenda" },
+	},
+	Paths = {
+		MissionFolder = "", MissionComplete = "",
+		PerfectMarker = "", PerfectLine = "", PerfectRemote = "",
+		ClassSpin = "", PassiveSpin = "",
+		CharacterFolder = "", UpgradeRemote = "",
+		ShopFolder = "", BuyRemote = "", MoneyValue = "",
+	},
+	-- Personagens que NUNCA são alvo (texto em minúsculo; basta o nome aparecer no prompt, no modelo ou nos textos sobre ele)
+	Blacklist = { "ember sage", "lenda de ember", "ilha dos drag" },
+	-- "E", "Click" ou combinados: "E+Click" (só E (padrão))
+	PerfectKey = "E",
+	SkipFlags = { "Robux", "Premium", "Gamepass", "Gems", "IsRobux" },
+	Builders = {
+		MissionComplete = function(mission) return mission end,
+		Upgrade = function(character) return character end,
+		Buy = function(item) return item end,
+		ClassSpin = function() return end,
+		PassiveSpin = function() return end,
+		Perfect = function() return end,
+	},
+	UpgradeCooldown = 1,
+	RarityKey = "Rarity",
+	RarityOrder = { "common", "uncommon", "rare", "epic", "legendary", "mythic", "exotic", "divine", "secret", "exclusive", "celestial" }, -- ordem do Index do jogo (detectada sozinha ao iniciar)
+	RarityFilter = {}, -- raridades marcadas (chave = nome em minúsculo)
+	StrictRarity = true, -- true = só vai nas marcadas | false = marcadas primeiro
+	AreaRadius = 550, -- studs: NÃO sai desta área (centro = onde você estava ao ligar)
+	AreaCenter = nil, AreaPinned = false,
+	PerfectTolerance = 4, -- px de folga
+	PerfectCooldown = 0.15, -- s entre repetições do E enquanto o risco está na zona
+	PerfectPresses = 3, -- máx. de E por rodada (se o 1º não registrar, repete)
+	DirectInput = true, -- reforço: também chama os scripts do jogo que escutam a tecla E
+	PerfectPoint = 0.5, -- 0 = borda do vermelho, 1 = só no centro
+	PerfectLead = 0.05, -- s de antecipação (compensa latência do input)
+	LockTimeout = 60,
+	RetryEvery = 3,
+	BegClickEvery = 1.5, -- s entre cliques no botão BEG!
+	NpcFallback = true, -- se nenhum prompt tiver as palavras-chave, usa NPCs com Humanoid
+	FlySpeed = 60,
+	MoveMode = "fly", -- "fly" (voando) ou "walk" (andando)
+	RaidDifficulty = "hard", -- easy | normal | hard
+	RaidWaitDiff = 0.5, -- s de espera depois de escolher a dificuldade
+	RaidWaitBest = 0.8, -- s de espera depois de selecionar os melhores
+	RaidStartEvery = 2, -- s entre cliques em "Iniciar"
+	RaidEntryEvery = 6, -- s entre tentativas de clicar em "Vá para a invasão"
+	RiftRadius = 200, -- studs: só interage com prompt de fenda a esta distância de você
+	RiftCooldown = 90, -- s: não viaja de novo para a mesma fenda
+	RaidPadRadius = 30, -- studs: distância máxima do prompt do centro da raid
+	AutoCloseDialog = true, -- aperta o X da conversa quando o personagem some (coletado ou foi embora)
+	CloseDelay = 0.5, -- s entre o personagem sumir e o clique no X
+	Pinned = false, WinPos = nil, IconId = "", -- Hub: fixado, posição e imagem do botão
+	LevelSelectWait = 0.35, -- s para o jogo mostrar o personagem escolhido antes de apertar o botão de nível
+	ClaimHidden = true, -- resgata também com o painel fechado (precisa de getconnections)
+}
+
+-- áreas que NÃO têm limite de raio (eventos que aparecem longe)
+Configuration.NoArea = { [Configuration.Keywords.Raid] = true }
+-- números ajustáveis na aba "Config. Autofarm" que são salvos
+Configuration.TunableKeys = {
+	"AreaRadius", "LockTimeout", "RetryEvery", "BegClickEvery", "PerfectPoint", "PerfectLead", "PerfectTolerance",
+	"PerfectPresses", "PerfectCooldown", "RaidWaitDiff", "RaidWaitBest", "RaidStartEvery", "RaidEntryEvery",
+	"RiftRadius", "RiftCooldown", "RaidPadRadius", "CloseDelay", "LevelSelectWait",
+}
+
+function Configuration.Save()
+	if not writefile then return false end
+	local ok = pcall(function()
+		writefile(FILE, HttpService:JSONEncode({
+			Paths = Configuration.Paths, Speed = Configuration.Speed,
+			Intervals = Configuration.Intervals, PerfectKey = Configuration.PerfectKey,
+			MoveMode = Configuration.MoveMode, FlySpeed = Configuration.FlySpeed,
+			Blacklist = Configuration.Blacklist, RaidDifficulty = Configuration.RaidDifficulty,
+			AutoCloseDialog = Configuration.AutoCloseDialog,
+			Pinned = Configuration.Pinned, WinPos = Configuration.WinPos, IconId = Configuration.IconId,
+			Tunables = (function()
+				local t = {}
+				for _, k in ipairs(Configuration.TunableKeys) do t[k] = Configuration[k] end
+				return t
+			end)(),
+			RarityFilter = (function()
+				local l = {}
+				for k in pairs(Configuration.RarityFilter) do l[#l + 1] = k end
+				return l
+			end)(),
+		}))
+	end)
+	return ok
+end
+function Configuration.Load()
+	if not (readfile and isfile and isfile(FILE)) then return end
+	pcall(function()
+		local d = HttpService:JSONDecode(readfile(FILE))
+		for k, v in pairs(d.Paths or {}) do Configuration.Paths[k] = v end
+		Configuration.Speed = d.Speed or 1
+		Configuration.Intervals = d.Intervals or {}
+		local known = {}
+		for _, n in ipairs(Configuration.RarityOrder) do known[n:lower()] = true end
+		for _, k in ipairs(d.RarityFilter or {}) do
+			if known[k] then Configuration.RarityFilter[k] = true end
+		end
+		if type(d.Tunables) == "table" then
+			for _, k in ipairs(Configuration.TunableKeys) do
+				local v = tonumber(d.Tunables[k])
+				if v then Configuration[k] = v end
+			end
+		end
+		if d.MoveMode == "walk" or d.MoveMode == "fly" then Configuration.MoveMode = d.MoveMode end
+		Configuration.FlySpeed = tonumber(d.FlySpeed) or Configuration.FlySpeed
+		Configuration.Pinned = d.Pinned == true
+		if type(d.AutoCloseDialog) == "boolean" then Configuration.AutoCloseDialog = d.AutoCloseDialog end
+		if type(d.WinPos) == "table" and tonumber(d.WinPos.x) and tonumber(d.WinPos.y) then
+			Configuration.WinPos = { x = tonumber(d.WinPos.x), y = tonumber(d.WinPos.y) }
+		end
+		if type(d.IconId) == "string" then
+			local id = d.IconId:gsub("%D", "")
+			Configuration.IconId = id
+		end
+		if d.RaidDifficulty == "easy" or d.RaidDifficulty == "normal" or d.RaidDifficulty == "hard" then
+			Configuration.RaidDifficulty = d.RaidDifficulty
+		end
+		if type(d.Blacklist) == "table" then
+			local l = {}
+			for _, w in ipairs(d.Blacklist) do
+				if type(w) == "string" and w ~= "" and w:lower() ~= "recruiter" then l[#l + 1] = w:lower() end
+			end
+			Configuration.Blacklist = l
+		end
+		-- config antiga salvava só "Click": ignora e usa o novo padrão
+		local pk = d.PerfectKey
+		if type(pk) == "string" and pk ~= "" and pk:lower() ~= "click" then Configuration.PerfectKey = pk end
+	end)
+end
+Configuration.Load()
+
+--==================================================================
+-- Utilitários compartilhados
+--==================================================================
+local Notifications = {}
+local Utils = {}
+
+function Utils.resolve(path)
+	if type(path) ~= "string" or path == "" then return nil end
+	local cur, first = nil, true
+	for seg in path:gmatch("[^%.]+") do
+		if first then
+			if seg == "LocalPlayer" then
+				cur = LocalPlayer
+			else
+				local ok, s = pcall(game.GetService, game, seg)
+				cur = (ok and s) or game:FindFirstChild(seg)
+			end
+			first = false
+		else
+			cur = cur and cur:FindFirstChild(seg)
+		end
+		if not cur then return nil end
+	end
+	return cur
+end
+
+function Utils.need(id, key)
+	local p = Configuration.Paths[key]
+	if not p or p == "" then
+		Toggles.Set(id, false)
+		Notifications.Push("Configuração necessária",
+			"Defina o caminho '" .. key .. "' em Configurações > Caminhos.", "warn")
+		return nil
+	end
+	return Utils.resolve(p)
+end
+
+function Utils.call(remote, ...)
+	if remote:IsA("RemoteEvent") then
+		remote:FireServer(...)
+		return true
+	elseif remote:IsA("RemoteFunction") then
+		return remote:InvokeServer(...)
+	end
+	error("Instância não é Remote: " .. remote:GetFullName())
+end
+
+local errAt = {}
+function Utils.softError(tag, err)
+	if os.clock() - (errAt[tag] or 0) > 10 then
+		errAt[tag] = os.clock()
+		warn("[BegABaddiesHub] " .. tostring(tag) .. ": " .. tostring(err))
+		Notifications.Push(tag, "Erro (segue rodando): " .. tostring(err), "warn")
+	end
+end
+
+local Prompts = {}
+local function track(d) if d:IsA("ProximityPrompt") then Prompts[d] = true end end
+for _, d in ipairs(workspace:GetDescendants()) do track(d) end
+connect(workspace.DescendantAdded, track)
+connect(workspace.DescendantRemoving, function(d) Prompts[d] = nil end)
+
+local function matches(text, words)
+	for _, w in ipairs(words) do
+		if #w <= 3 then
+			if text:find("%f[%a]" .. w:gsub("%p", "%%%0") .. "%f[%A]") then return true end
+		elseif text:find(w, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+--==================================================================
+-- Lista de bloqueio: personagens que nunca viram alvo
+--==================================================================
+local BlackCache = setmetatable({}, { __mode = "k" })
+
+local function blackText(p)
+	local parts = { p.ObjectText, p.ActionText, p:GetFullName() }
+	local model = p:FindFirstAncestorOfClass("Model")
+	if model then
+		table.insert(parts, model.Name)
+		for _, v in pairs(model:GetAttributes()) do
+			if type(v) == "string" then table.insert(parts, v) end
+		end
+		for _, d in ipairs(model:GetDescendants()) do
+			if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" then
+				table.insert(parts, d.Text)
+			end
+		end
+		-- placas (BillboardGui) que ficam no PlayerGui apontando para o modelo
+		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		if pg then
+			for _, b in ipairs(pg:GetChildren()) do
+				if b:IsA("BillboardGui") and b.Adornee and b.Adornee:IsDescendantOf(model) then
+					for _, d in ipairs(b:GetDescendants()) do
+						if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" then
+							table.insert(parts, d.Text)
+						end
+					end
+				end
+			end
+		end
+	end
+	return (table.concat(parts, " | "):gsub("<[^>]+>", "")):lower()
+end
+
+function Utils.isBlacklisted(p)
+	local list = Configuration.Blacklist
+	if not list or #list == 0 then return false end
+	local c = BlackCache[p]
+	if not c or os.clock() - c.t > 5 then
+		c = { text = blackText(p), t = os.clock() }
+		BlackCache[p] = c
+	end
+	for _, w in ipairs(list) do
+		if w ~= "" and c.text:find(w, 1, true) then return true end
+	end
+	return false
+end
+
+-- Raridade
+local RarityCache = setmetatable({}, { __mode = "k" })
+
+local function rankFromText(text)
+	text = text:lower()
+	local bestIdx, bestLen
+	for i, name in ipairs(Configuration.RarityOrder) do
+		local n = name:lower()
+		if text:find("%f[%a]" .. n:gsub("%p", "%%%0") .. "%f[%A]") and (not bestLen or #n > bestLen) then
+			bestIdx, bestLen = i, #n
+		end
+	end
+	return bestIdx
+end
+
+-- texto inteiro igual a um nome de raridade (ex.: "Legendary")
+local function exactRank(text)
+	local t = text:gsub("<[^>]+>", ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+	for i, name in ipairs(Configuration.RarityOrder) do
+		if t == name:lower() then return i end
+	end
+	return nil
+end
+
+local INCOME_UNITS = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qi = 1e18, sx = 1e21, sp = 1e24, o = 1e27, n = 1e30, d = 1e33 }
+local function parseIncome(text)
+	local num, unit = text:match("%$%s*([%d%.,]+)%s*(%a*)%s*/%s*[sS]")
+	if not num then return nil end
+	num = tonumber((num:gsub(",", "")))
+	if not num then return nil end
+	return num * (INCOME_UNITS[unit:lower()] or 1)
+end
+
+-- Devolve (raridade, renda/s). Raridade: Attribute/Value -> texto do prompt -> textos do personagem.
+-- Renda: o "+$240,000/s" que aparece sobre o personagem (quanto maior, mais raro).
+function Utils.rarityInfo(p)
+	local c = RarityCache[p]
+	if c and ((c.rank and c.income > 0) or os.clock() - c.t < 4) then return c.rank, c.income end
+	local rank
+	local node = p
+	for _ = 1, 6 do
+		if not node or node == workspace then break end
+		local v = node:GetAttribute(Configuration.RarityKey)
+		if v == nil then
+			local ch = node:FindFirstChild(Configuration.RarityKey)
+			if ch and ch:IsA("ValueBase") then v = ch.Value end
+		end
+		if v ~= nil then
+			rank = (type(v) == "number") and v or (rankFromText(tostring(v)) or 0)
+			break
+		end
+		local ex = exactRank(node.Name)
+		if ex then
+			rank = ex
+			break
+		end
+		node = node.Parent
+	end
+	if not rank then rank = rankFromText(p.ObjectText .. " " .. p.ActionText) end
+	local scanRank = (rank == nil)
+	local income = parseIncome(p.ObjectText .. " " .. p.ActionText) or 0
+	local exact = false
+	local model = p:FindFirstAncestorOfClass("Model")
+	local function consider(d)
+		if d:IsA("TextLabel") or d:IsA("TextButton") then
+			local txt = d.Text
+			if scanRank and not exact then
+				local ex = exactRank(txt)
+				if ex then
+					rank, exact = ex, true
+				else
+					local r = rankFromText(txt)
+					if r and (not rank or r > rank) then rank = r end
+				end
+			end
+			local inc = parseIncome(txt)
+			if inc and inc > income then income = inc end
+		end
+	end
+	if model then
+		if scanRank then
+			for _, v in pairs(model:GetAttributes()) do
+				if type(v) == "string" then
+					local r = exactRank(v) or rankFromText(v)
+					if r and (not rank or r > rank) then rank = r end
+				end
+			end
+		end
+		for _, d in ipairs(model:GetDescendants()) do consider(d) end
+		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		if pg then
+			for _, b in ipairs(pg:GetChildren()) do
+				if b:IsA("BillboardGui") and b.Adornee and b.Adornee:IsDescendantOf(model) then
+					for _, d in ipairs(b:GetDescendants()) do consider(d) end
+				end
+			end
+		end
+	end
+	RarityCache[p] = { rank = rank, income = income, t = os.clock() }
+	return rank, income
+end
+
+function Utils.rarityRank(p)
+	local r = Utils.rarityInfo(p)
+	return r
+end
+
+-- Visível de verdade?
+function Utils.shown(g)
+	while g and g ~= game do
+		if g:IsA("GuiObject") and not g.Visible then return false end
+		if g:IsA("LayerCollector") and not g.Enabled then return false end
+		g = g.Parent
+	end
+	return true
+end
+
+local function isRedColor(c) return c.R > 0.6 and c.G < 0.32 and c.B < 0.5 and (c.R - c.G) > 0.4 end
+
+-- Considera a cor base multiplicada pelo UIGradient (muitos jogos pintam com gradiente)
+local function tinted(base, g)
+	local gr = g:FindFirstChildOfClass("UIGradient")
+	if gr then
+		local kp = gr.Color.Keypoints
+		local k = kp[math.ceil(#kp / 2)].Value
+		return Color3.new(base.R * k.R, base.G * k.G, base.B * k.B)
+	end
+	return base
+end
+
+function Utils.isRed(g)
+	if g.BackgroundTransparency < 0.9 and isRedColor(tinted(g.BackgroundColor3, g)) then return true end
+	if (g:IsA("ImageLabel") or g:IsA("ImageButton")) and g.ImageTransparency < 0.9
+		and isRedColor(tinted(g.ImageColor3, g)) then
+		return true
+	end
+	return false
+end
+
+-- Clique real na tela (coordenadas corrigidas pelo inset da GUI)
+function Utils.clickAt(pos, gui)
+	local sg = gui and gui:FindFirstAncestorOfClass("ScreenGui")
+	local off = (sg and sg.IgnoreGuiInset) and Vector2.zero or GuiService:GetGuiInset()
+	VIM:SendMouseButtonEvent(pos.X + off.X, pos.Y + off.Y, 0, true, game, 0)
+	task.wait(0.02)
+	VIM:SendMouseButtonEvent(pos.X + off.X, pos.Y + off.Y, 0, false, game, 0)
+end
+
+-- No celular o jogo só aceita E quando o último input foi de teclado ("modo computador").
+-- Manda uma tecla neutra (F13) para forçar esse modo antes de interagir / apertar E.
+function Utils.wakeKeyboard()
+	local ok, key = pcall(function() return Enum.KeyCode.F13 end)
+	if not (ok and key) then key = Enum.KeyCode.RightControl end
+	pcall(function()
+		VIM:SendKeyEvent(true, key, false, game)
+		task.wait(0.01)
+		VIM:SendKeyEvent(false, key, false, game)
+	end)
+end
+
+-- Clica num botão: tenta disparar as conexões do botão; senão, clique real no centro.
+function Utils.clickGui(g, onlyConnections)
+	if g:IsA("GuiButton") and getconnections then
+		local fired = false
+		for _, ev in ipairs({ g.Activated, g.MouseButton1Click }) do
+			local ok, conns = pcall(getconnections, ev)
+			if ok and conns then
+				for _, c in ipairs(conns) do
+					if pcall(function() c:Fire() end) then fired = true end
+				end
+			end
+		end
+		if fired then return true end
+	end
+	if onlyConnections then return false end
+	Utils.clickAt(g.AbsolutePosition + g.AbsoluteSize / 2, g)
+	return true
+end
+
+-- Procura o botão "BEG!" do diálogo (texto exato, visível, fora da UI do hub)
+local begCache
+local function onScreen(g)
+	local cam = workspace.CurrentCamera
+	if not cam then return true end
+	local vp, pos, size = cam.ViewportSize, g.AbsolutePosition, g.AbsoluteSize
+	return pos.X + size.X > 0 and pos.Y + size.Y > 0 and pos.X < vp.X and pos.Y < vp.Y
+end
+function Utils.findBeg()
+	if begCache and begCache.Parent and Utils.shown(begCache) and onScreen(begCache) then return begCache end
+	begCache = nil
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if not pg then return nil end
+	for _, g in ipairs(pg:GetDescendants()) do
+		if (g:IsA("TextButton") or g:IsA("TextLabel")) and g.AbsoluteSize.X > 0 and g.AbsoluteSize.Y > 0 then
+			local t = g.Text:gsub("<[^>]+>", "")
+			t = t:gsub("%s", ""):lower()
+			if t == "beg!" and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) and Utils.shown(g) and onScreen(g) then
+				local node, clickable = g, g
+				for _ = 1, 4 do
+					if node:IsA("GuiButton") then clickable = node break end
+					node = node.Parent
+					if not node or not node:IsA("GuiObject") then break end
+				end
+				begCache = clickable
+				return clickable
+			end
+		end
+	end
+	return nil
+end
+
+-- Acha e aperta o "X" da tela de conversa. Procura primeiro perto do botão BEG! (chain = ancestrais dele),
+-- depois na ScreenGui inteira. Nunca mexe em outras telas.
+local CLOSE_TEXT = { ["x"] = true, ["×"] = true, ["✕"] = true, ["✖"] = true, ["╳"] = true, ["✗"] = true }
+local function findX(root)
+	local best, bscore
+	for _, g in ipairs(root:GetDescendants()) do
+		if g:IsA("GuiButton") and g.AbsoluteSize.X > 0 and Utils.shown(g) and onScreen(g)
+			and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) then
+			local n = g.Name:lower()
+			local t = (Utils.textOf(g):gsub("%s", ""))
+			if CLOSE_TEXT[t] or n:find("close", 1, true) or n:find("fechar", 1, true) or n == "x"
+				or n:find("exit", 1, true) or n:find("xbutton", 1, true) or n:find("xbtn", 1, true) then
+				local score = g.AbsolutePosition.X - g.AbsolutePosition.Y * 0.5 -- prefere o canto superior direito
+				if not bscore or score > bscore then best, bscore = g, score end
+			end
+		end
+	end
+	return best
+end
+function Utils.closeDialog(chain, sg)
+	for _, node in ipairs(chain or {}) do
+		if node.Parent and node:IsDescendantOf(game) then
+			local x = findX(node)
+			if x then
+				Utils.clickGui(x)
+				return true
+			end
+		end
+	end
+	if sg and sg.Parent then
+		local x = findX(sg)
+		if x then
+			Utils.clickGui(x)
+			return true
+		end
+	end
+	return false
+end
+
+-- Estado do minigame
+Utils.Minigame = { active = false, windowUntil = 0, seen = false, warned = false, count = 0 }
+local Mini = Utils.Minigame
+
+local Lock = { id = nil, target = nil, since = 0, engaged = false, lastFire = 0 }
+local Ignored = setmetatable({}, { __mode = "k" })
+
+local function valid(t)
+	return t and t.prompt.Parent and t.prompt:IsDescendantOf(workspace) and t.part:IsDescendantOf(workspace)
+end
+local function release() Lock.target, Lock.id, Lock.engaged, Lock.offSince = nil, nil, false, nil end
+
+local function npcPrompt(p)
+	local model = p:FindFirstAncestorOfClass("Model")
+	if not model or Players:GetPlayerFromCharacter(model) then return false end
+	return model:FindFirstChildWhichIsA("Humanoid", true) ~= nil
+		or model:FindFirstChildWhichIsA("AnimationController", true) ~= nil
+end
+
+-- Melhor alvo. Passo 1: palavras-chave. Passo 2 (só com fallback): qualquer NPC.
+-- Personagens da lista de bloqueio são sempre ignorados.
+-- Com raridades marcadas (só no Auto Talk): as marcadas ganham sempre; se StrictRarity, as outras são ignoradas.
+-- Entre iguais: mais rara -> maior renda/s -> mais próxima.
+function Utils.pickTarget(keywords, exclude, fallback)
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+	local rareOn = Toggles.Get("rarest")
+	-- o filtro só vale pro Auto Talk (missões não têm raridade)
+	local filterOn = keywords == Configuration.Keywords.Talk and next(Configuration.RarityFilter) ~= nil
+	local center = Configuration.AreaCenter or hrp.Position
+	local radius = Configuration.AreaRadius
+	if keywords == Configuration.Keywords.Rift then -- fenda: só o que está perto de você agora
+		center, radius = hrp.Position, Configuration.RiftRadius
+	end
+	local best
+	for pass = 1, 2 do
+		if pass == 2 and (best or not (fallback and Configuration.NpcFallback)) then break end
+		for p in pairs(Prompts) do
+			local ig = Ignored[p]
+			if p.Enabled and p:IsDescendantOf(workspace) and not (ig and os.clock() < ig) then
+				local text = (p.ObjectText .. " " .. p.ActionText .. " " .. p:GetFullName()):lower()
+				local ok
+				if pass == 1 then ok = matches(text, keywords) else ok = npcPrompt(p) end
+				if ok and not (exclude and matches(text, exclude)) and not Utils.isBlacklisted(p) then
+					local part = p.Parent
+					if part and part:IsA("Attachment") then part = part.Parent end
+					if part and part:IsA("BasePart") then
+						local d = (hrp.Position - part.Position).Magnitude
+						if Configuration.NoArea[keywords] or (center - part.Position).Magnitude <= radius then
+							local rank, income, allowed = 0, 0, true
+							if rareOn or filterOn then
+								local r, inc = Utils.rarityInfo(p)
+								rank, income = r or 0, inc or 0
+								if filterOn then
+									local nm = r and Configuration.RarityOrder[r]
+									if nm then
+										if Configuration.RarityFilter[nm:lower()] then
+											rank += 100 -- marcadas sempre vencem
+										elseif Configuration.StrictRarity then
+											allowed = false
+										end
+									end
+									-- raridade ilegível: NÃO exclui (ordena pela renda/s), pra nunca ficar parado
+								end
+							end
+							if allowed and (not best or rank > best.rank
+								or (rank == best.rank and (income > best.income or (income == best.income and d < best.dist)))) then
+								best = { prompt = p, part = part, dist = d, rank = rank, income = income }
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+function Utils.lockedTarget(id, keywords, exclude, fallback)
+	local t = Lock.target
+	if t then
+		if not valid(t) or not Toggles.Active(Lock.id) or Utils.isBlacklisted(t.prompt) then
+			release()
+		elseif os.clock() - Lock.since > Configuration.LockTimeout then
+			Ignored[t.prompt] = os.clock() + 60
+			release()
+		elseif not t.prompt.Enabled then
+			-- prompt desligado (já conversou / cooldown): não fica parado esperando
+			Lock.offSince = Lock.offSince or os.clock()
+			if os.clock() - Lock.offSince > 2 and not Utils.findBeg() and not Mini.active then
+				Ignored[t.prompt] = os.clock() + 30
+				release()
+			end
+		else
+			Lock.offSince = nil
+		end
+	end
+	if not Lock.target then
+		local best = Utils.pickTarget(keywords, exclude, fallback)
+		if best then
+			Lock.target, Lock.id, Lock.since, Lock.engaged, Lock.lastFire = best, id, os.clock(), false, 0
+			Lock.lastDist, Lock.lastProgress = nil, os.clock()
+			Lock.fires, Lock.offSince = 0, nil
+			Notifications.Push("Alvo", ("%s (%.0f studs)"):format(best.prompt.Parent and best.prompt.Parent.Name or "?", best.dist))
+		elseif os.clock() - (Lock.clearedAt or 0) > 30 then
+			Lock.clearedAt = os.clock()
+			for k in pairs(Ignored) do Ignored[k] = nil end -- dá nova chance aos alvos pulados
+		end
+	elseif Lock.id == id and not Lock.engaged and os.clock() - (Lock.repickAt or 0) > 1 then
+		Lock.repickAt = os.clock()
+		local best = Utils.pickTarget(keywords, exclude, fallback)
+		if best and (best.rank > Lock.target.rank
+			or (best.rank == Lock.target.rank and best.income > (Lock.target.income or 0) * 1.5)) then
+			Lock.target, Lock.since = best, os.clock()
+		end
+	end
+	if Lock.id == id then return Lock.target end
+	return nil
+end
+
+function Utils.currentTarget()
+	local t = Lock.target
+	if t and Lock.id and Toggles.Active(Lock.id) and valid(t) then return t end
+	return nil
+end
+
+function Utils.interact(id, keywords, exclude, fallback)
+	if not fireproximityprompt then
+		Toggles.Set(id, false)
+		Notifications.Push("Executor incompatível", "fireproximityprompt não está disponível.", "error")
+		return
+	end
+	local t = Utils.lockedTarget(id, keywords, exclude, fallback)
+	if not t then return end
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hrp then return end
+	local dist = (hrp.Position - t.part.Position).Magnitude
+	if dist <= t.prompt.MaxActivationDistance + 1 then
+		Lock.engaged = true
+		if Mini.active then return end
+		if t.prompt.Enabled and os.clock() - Lock.lastFire >= Configuration.RetryEvery then
+			Lock.lastFire = os.clock()
+			Lock.fires = (Lock.fires or 0) + 1
+			if Lock.fires > 6 then
+				Ignored[t.prompt] = os.clock() + 30
+				release()
+				return
+			end
+			Mini.windowUntil = os.clock() + 10
+			pcall(function()
+				t.prompt.HoldDuration = 0
+				t.prompt.RequiresLineOfSight = false
+			end)
+			Utils.wakeKeyboard()
+			fireproximityprompt(t.prompt)
+			task.delay(6, function()
+				if not Hub.Destroyed and Toggles.Active("perfect") and not Mini.seen and not Mini.warned
+					and Utils.findBeg() then
+					Mini.warned = true
+					Notifications.Push("Beg", "Não detectei a linha vermelha. Abra o minigame, use o scan vermelho (aba Movimento) e preencha PerfectLine/PerfectMarker.", "warn")
+				end
+			end)
+		end
+	elseif Toggles.Get("moveto") and Configuration.MoveMode == "walk" and hum then
+		hum:MoveTo(t.part.Position)
+		if dist < (Lock.lastDist or math.huge) - 2 then
+			Lock.lastDist, Lock.lastProgress = dist, os.clock()
+		elseif os.clock() - (Lock.lastProgress or os.clock()) > 3 then
+			-- travou em parede/obstáculo: pula e dá um empurrão em direção ao alvo
+			hum.Jump = true
+			local dir = t.part.Position - hrp.Position
+			local stop = math.max(3, t.prompt.MaxActivationDistance * 0.7)
+			if dir.Magnitude > stop then
+				hrp.CFrame = hrp.CFrame + dir.Unit * math.min(dir.Magnitude - stop, 20)
+			end
+			Lock.lastProgress = os.clock() - 2
+		end
+	end
+end
+
+-- Tenta fechar o diálogo (botão cujo nome contém "close" na mesma ScreenGui)
+local function tryClose(btn)
+	local sg = btn:FindFirstAncestorOfClass("ScreenGui")
+	if Utils.closeDialog(Utils.BegChain, sg) then return end
+	if not sg then return end
+	for _, d in ipairs(sg:GetDescendants()) do
+		if d:IsA("GuiButton") and d.Name:lower():find("close") and Utils.shown(d) then
+			Utils.clickGui(d)
+			return
+		end
+	end
+end
+
+-- Fluxo completo da conversa:
+--  diálogo fechado -> vai ao alvo e dispara o prompt
+--  diálogo aberto  -> aperta BEG! (o módulo Beg acerta o perfeito) e repete a cada tentativa
+local Beg = { last = 0, streak = 0, count = 0 }
+-- O personagem da conversa sumiu? (removido do mapa, ficou invisível ou foi embora)
+local function watchGone(w)
+	local pr, part, model = w.prompt, w.part, w.model
+	if not (pr.Parent and pr:IsDescendantOf(workspace)) then return true end
+	if not (part.Parent and part:IsDescendantOf(workspace)) then return true end
+	if model and not model:IsDescendantOf(workspace) then return true end
+	if w.pos and (part.Position - w.pos).Magnitude > 60 then return true end
+	if w.hadVisible and model then
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") and d.Transparency < 0.95 then return false end
+		end
+		return true
+	end
+	return false
+end
+function Utils.begStep(id, keywords, exclude, fallback)
+	local btn = Utils.findBeg()
+	if btn then
+		-- guarda onde o diálogo está (para achar o X) e QUEM é o personagem da conversa
+		Beg.sg = btn:FindFirstAncestorOfClass("ScreenGui")
+		local chain, a = {}, btn.Parent
+		for _ = 1, 6 do
+			if not (a and a:IsA("GuiObject")) then break end
+			chain[#chain + 1] = a
+			a = a.Parent
+		end
+		Utils.BegChain = chain
+		local t = Lock.target
+		if t and Lock.id == id and not (Beg.watch and Beg.watch.prompt == t.prompt) then
+			local model = t.prompt:FindFirstAncestorOfClass("Model")
+			local vis = false
+			if model then
+				for _, d in ipairs(model:GetDescendants()) do
+					if d:IsA("BasePart") and d.Transparency < 0.95 then vis = true break end
+				end
+			end
+			Beg.watch = { prompt = t.prompt, part = t.part, model = model, pos = t.part.Position, hadVisible = vis }
+			Beg.goneAt, Beg.closeTries = nil, 0
+		end
+		Beg.watchSeen = os.clock()
+	end
+	if Mini.active then Beg.watchSeen = os.clock() end
+	-- só aperta o X quando o personagem SUMIR (coletado ou foi embora): nunca antes
+	if Configuration.AutoCloseDialog and Beg.watch then
+		if os.clock() - (Beg.watchSeen or 0) > 5 then
+			Beg.watch, Beg.goneAt = nil, nil -- o diálogo já fechou sozinho
+		elseif not Mini.active and watchGone(Beg.watch) then
+			Beg.goneAt = Beg.goneAt or os.clock()
+			if os.clock() - Beg.goneAt >= Configuration.CloseDelay and os.clock() - (Beg.lastCloseTry or 0) >= 0.6 then
+				Beg.lastCloseTry = os.clock()
+				Beg.closeTries = (Beg.closeTries or 0) + 1
+				local closed = Utils.closeDialog(Utils.BegChain, Beg.sg)
+				if closed or Beg.closeTries >= 4 then
+					Beg.watch, Beg.goneAt, Beg.closeTries = nil, nil, 0
+					Beg.last = os.clock()
+					if not closed and Utils.findBeg() and os.clock() - (Beg.warnedClose or 0) > 60 then
+						Beg.warnedClose = os.clock()
+						Notifications.Push("Beg", "O personagem sumiu mas não achei o X da conversa.", "warn")
+					end
+				end
+			end
+		end
+	end
+	if btn and os.clock() < (Beg.skipUntil or 0) then btn = nil end -- desistiu deste diálogo: segue pro próximo alvo
+	if not btn then
+		Beg.streak = 0
+		return Utils.interact(id, keywords, exclude, fallback)
+	end
+	Lock.fires = 0
+	if Lock.id == id then Lock.engaged = true end
+	if Mini.active or os.clock() - Beg.last < Configuration.BegClickEvery then return end
+	if Mini.count ~= Beg.count then Beg.count, Beg.streak = Mini.count, 0 end
+	if Beg.streak >= 5 then
+		Beg.streak = 0
+		Beg.skipUntil = os.clock() + 10
+		if Lock.target then Ignored[Lock.target.prompt] = os.clock() + 60 end
+		release()
+		pcall(tryClose, btn)
+		Notifications.Push("Beg", "O BEG! não iniciou o minigame 5x. Fechando e pulando este alvo.", "warn")
+		return
+	end
+	Beg.last, Beg.streak = os.clock(), Beg.streak + 1
+	Mini.windowUntil = os.clock() + 8
+	Utils.wakeKeyboard()
+	Utils.clickGui(btn)
+end
+
+function Configuration.ScanRed()
+	local out = {}
+	for _, g in ipairs(LocalPlayer:WaitForChild("PlayerGui"):GetDescendants()) do
+		if g:IsA("GuiObject") and Utils.shown(g) and Utils.isRed(g) then
+			table.insert(out, "LINHA VERMELHA? " .. g:GetFullName())
+			for _, sib in ipairs(g.Parent and g.Parent:GetChildren() or {}) do
+				if sib ~= g and sib:IsA("GuiObject") and Utils.shown(sib) then
+					table.insert(out, "    irmão visível (marcador?): " .. sib:GetFullName())
+				end
+			end
+		end
+	end
+	if #out == 0 then out[1] = "Nenhuma GUI vermelha visível. Abra o minigame e tente de novo." end
+	local text = table.concat(out, "\n")
+	print(text)
+	if setclipboard then pcall(setclipboard, text) end
+	Notifications.Push("Scan vermelho", #out .. " linhas no console" .. (setclipboard and " e na área de transferência." or "."))
+end
+
+local function dumpModel(p)
+	local model = p:FindFirstAncestorOfClass("Model")
+	if not model then return "    (sem Model)" end
+	local parts = {}
+	for k, v in pairs(model:GetAttributes()) do table.insert(parts, "attr " .. k .. "=" .. tostring(v)) end
+	local n = 0
+	for _, d in ipairs(model:GetDescendants()) do
+		if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" then
+			n += 1
+			if n <= 12 then table.insert(parts, "texto '" .. d.Text:sub(1, 30) .. "'") end
+		end
+	end
+	return "    modelo " .. model.Name .. " | " .. table.concat(parts, " | ")
+end
+
+function Configuration.ScanNearby()
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	local list = {}
+	for p in pairs(Prompts) do
+		local part = p.Parent
+		if part and part:IsA("Attachment") then part = part.Parent end
+		if part and part:IsA("BasePart") then
+			table.insert(list, { p = p, d = (hrp.Position - part.Position).Magnitude })
+		end
+	end
+	table.sort(list, function(a, b) return a.d < b.d end)
+	local out = {}
+	for i = 1, math.min(15, #list) do
+		local e = list[i]
+		local rk, inc = Utils.rarityInfo(e.p)
+		table.insert(out, ("%.0f studs | ativo=%s | bloqueado=%s | objeto='%s' | ação='%s' | raridade=%s | renda=%s | %s"):format(
+			e.d, tostring(e.p.Enabled), tostring(Utils.isBlacklisted(e.p)), e.p.ObjectText, e.p.ActionText,
+			tostring(rk), tostring(inc), e.p:GetFullName()))
+		if i <= 3 then table.insert(out, dumpModel(e.p)) end
+	end
+	if #out == 0 then out[1] = "Nenhum prompt encontrado." end
+	local text = table.concat(out, "\n")
+	print(text)
+	if setclipboard then pcall(setclipboard, text) end
+	Notifications.Push("Prompts por perto", #out .. " linhas no console" .. (setclipboard and " e na área de transferência." or "."))
+end
+
+function Configuration.Scan()
+	local out = { "== REMOTES (ReplicatedStorage) ==" }
+	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+			table.insert(out, d.ClassName .. ": " .. d:GetFullName())
+		end
+	end
+	table.insert(out, "== PROXIMITY PROMPTS ==")
+	for p in pairs(Prompts) do
+		table.insert(out, ("%s | objeto='%s' | ação='%s'"):format(p:GetFullName(), p.ObjectText, p.ActionText))
+	end
+	table.insert(out, "== PLAYERGUI ==")
+	for _, g in ipairs(LocalPlayer:WaitForChild("PlayerGui"):GetChildren()) do
+		table.insert(out, g.ClassName .. ": " .. g.Name)
+	end
+	local ls = LocalPlayer:FindFirstChild("leaderstats")
+	if ls then
+		table.insert(out, "== LEADERSTATS ==")
+		for _, v in ipairs(ls:GetChildren()) do table.insert(out, v.ClassName .. ": " .. v:GetFullName()) end
+	end
+	local text = table.concat(out, "\n")
+	print(text)
+	if setclipboard then pcall(setclipboard, text) end
+	Notifications.Push("Scan concluído", #out .. " linhas no console" .. (setclipboard and " e na área de transferência." or "."))
+end
+
+-- Lê a lista de raridades direto do Index (linhas "Common 8/8", "Rare 9/9"...)
+function Configuration.DetectRarities(silent)
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local found, seen = {}, {}
+	if pg then
+		for _, g in ipairs(pg:GetDescendants()) do
+			if g:IsA("TextLabel") and g.Parent and g.Text:match("^%s*%d+%s*/%s*%d+%s*$") then
+				for _, s in ipairs(g.Parent:GetChildren()) do
+					if s:IsA("TextLabel") and s ~= g then
+						local t = s.Text:gsub("<[^>]+>", ""):gsub("^%s+", ""):gsub("%s+$", "")
+						local key = t:lower()
+						if t:match("^%a+$") and #t >= 4 and #t <= 14 and key ~= "todos" and key ~= "all" and not seen[key] then
+							seen[key] = true
+							table.insert(found, { name = t, y = g.Parent.AbsolutePosition.Y, i = #found })
+						end
+					end
+				end
+			end
+		end
+	end
+	if #found < 3 or not seen.common then
+		if not silent then
+			Notifications.Push("Raridades", "Não achei a lista. Abra o Index e tente de novo (mantive a padrão).", "warn")
+		end
+		return false
+	end
+	table.sort(found, function(a, b) if a.y ~= b.y then return a.y < b.y end return a.i < b.i end)
+	local list = {}
+	for _, f in ipairs(found) do table.insert(list, f.name) end
+	Configuration.RarityOrder = list
+	if not silent then Notifications.Push("Raridades", #list .. " raridades detectadas no Index.") end
+	return true
+end
+
+--==================================================================
+-- Interface/MainUI
+--==================================================================
+local function safeParent()
+	local ok, ui = pcall(function() return (gethui and gethui()) or game:GetService("CoreGui") end)
+	if ok and ui then return ui end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local Gui = create("ScreenGui", {
+	Name = "BegABaddiesHub", ResetOnSpawn = false, DisplayOrder = 999,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = safeParent(),
+})
+Hub.Gui = Gui
+table.insert(Hub.Cleanup, Gui)
+
+local Scale = create("UIScale", { Scale = 0.85 })
+local Win = create("Frame", {
+	Name = "Window", Size = UDim2.fromOffset(620, 400), Position = UDim2.new(0.5, -310, 0.5, -200),
+	BackgroundColor3 = Theme.Bg, BackgroundTransparency = 0.04, ClipsDescendants = true, Parent = Gui,
+}, {
+	round(14), stroke(Theme.Accent, 1.5, 0.25), Scale,
+	create("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(36, 21, 64), Theme.Bg), Rotation = 125 }),
+})
+tween(Scale, 0.3, { Scale = 1 })
+
+local Header = create("Frame", { Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1, Active = true, Parent = Win })
+create("TextLabel", {
+	Text = "◆ Beg a Baddies Hub", Font = Theme.FontBold, TextSize = 16, TextColor3 = Theme.Accent2,
+	BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 0), Size = UDim2.new(0, 200, 1, 0),
+	TextXAlignment = Enum.TextXAlignment.Left, Parent = Header,
+})
+local ActiveLabel = create("TextLabel", {
+	Text = "0 ativas", Font = Theme.Font, TextSize = 12, TextColor3 = Theme.Sub, BackgroundTransparency = 1,
+	Position = UDim2.new(0, 220, 0, 0), Size = UDim2.new(1, -366, 1, 0), TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = Header,
+})
+create("Frame", {
+	Size = UDim2.new(1, -24, 0, 1), Position = UDim2.new(0, 12, 1, -1), BackgroundColor3 = Theme.Accent,
+	BackgroundTransparency = 0.7, BorderSizePixel = 0, Parent = Header,
+})
+local function headerButton(text, xFromRight)
+	return create("TextButton", {
+		Text = text, Font = Theme.FontBold, TextSize = 16, TextColor3 = Theme.Text, AutoButtonColor = false,
+		BackgroundColor3 = Theme.Card, Size = UDim2.fromOffset(28, 28), AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, xFromRight, 0.5, 0), Parent = Header,
+	}, { round(8) })
+end
+local BtnMin = headerButton("–", -48)
+local BtnClose = headerButton("×", -12)
+local BtnPin = headerButton("📌", -84)
+
+local Body = create("Frame", { Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -44), BackgroundTransparency = 1, Parent = Win })
+local Sidebar = create("ScrollingFrame", {
+	Position = UDim2.fromOffset(8, 8), Size = UDim2.new(0, 150, 1, -16), BackgroundColor3 = Theme.Side,
+	BackgroundTransparency = 0.2, ScrollBarThickness = 0, BorderSizePixel = 0,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), Parent = Body,
+}, {
+	round(12),
+	create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
+	create("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }),
+})
+local Content = create("Frame", {
+	Position = UDim2.fromOffset(166, 8), Size = UDim2.new(1, -174, 1, -16), BackgroundTransparency = 1, Parent = Body,
+})
+
+-- Arrastar (desligado com o Hub fixado) e sem sair da tela
+local function clampWin(x, y)
+	local vp = Gui.AbsoluteSize
+	return math.clamp(x, 0, math.max(0, vp.X - 140)), math.clamp(y, 0, math.max(0, vp.Y - 44))
+end
+do
+	local dragging, dragStart, startAbs
+	connect(Header.InputBegan, function(i)
+		if Configuration.Pinned then return end
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart = true, i.Position
+			startAbs = Win.AbsolutePosition - Gui.AbsolutePosition
+		end
+	end)
+	connect(UIS.InputChanged, function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - dragStart
+			local x, y = clampWin(startAbs.X + d.X, startAbs.Y + d.Y)
+			Win.Position = UDim2.fromOffset(x, y)
+		end
+	end)
+	connect(UIS.InputEnded, function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end)
+end
+
+-- Redimensionar
+local Grip = create("TextButton", {
+	Text = "◢", Font = Theme.FontBold, TextSize = 14, TextColor3 = Theme.Accent2, BackgroundTransparency = 1,
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -2, 1, -2), Size = UDim2.fromOffset(20, 20),
+	ZIndex = 5, Parent = Win,
+})
+do
+	local resizing, startMouse, startSize
+	connect(Grip.InputBegan, function(i)
+		if Configuration.Pinned then return end
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			resizing, startMouse, startSize = true, i.Position, Win.AbsoluteSize
+		end
+	end)
+	connect(UIS.InputChanged, function(i)
+		if resizing and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - startMouse
+			Win.Size = UDim2.fromOffset(math.clamp(startSize.X + d.X, 480, 900), math.clamp(startSize.Y + d.Y, 300, 650))
+		end
+	end)
+	connect(UIS.InputEnded, function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then resizing = false end
+	end)
+end
+
+-- Minimizar / fechar / atalho
+local minimized, fullSize = false, nil
+local function setMinimized(v)
+	minimized = v
+	if v then
+		fullSize = Win.Size
+		Body.Visible, Grip.Visible = false, false
+		tween(Win, 0.25, { Size = UDim2.new(fullSize.X.Scale, fullSize.X.Offset, 0, 44) })
+	else
+		tween(Win, 0.25, { Size = fullSize })
+		task.delay(0.2, function()
+			if not minimized then Body.Visible, Grip.Visible = true, not Configuration.Pinned end
+		end)
+	end
+end
+connect(BtnMin.MouseButton1Click, function() setMinimized(not minimized) end)
+connect(BtnClose.MouseButton1Click, function()
+	tween(Scale, 0.2, { Scale = 0.85 })
+	task.delay(0.2, function() Hub.Destroy() end)
+end)
+connect(UIS.InputBegan, function(i, processed)
+	if not processed and i.KeyCode == Enum.KeyCode.RightShift then Win.Visible = not Win.Visible end
+end)
+
+-- Fixar o Hub (📌): não arrasta nem redimensiona; posição salva
+local function renderPin()
+	BtnPin.BackgroundColor3 = Configuration.Pinned and Theme.Accent or Theme.Card
+	Grip.Visible = (not Configuration.Pinned) and (not minimized)
+end
+connect(BtnPin.MouseButton1Click, function()
+	Configuration.Pinned = not Configuration.Pinned
+	if Configuration.Pinned then
+		local p = Win.AbsolutePosition - Gui.AbsolutePosition
+		Configuration.WinPos = { x = p.X, y = p.Y }
+	end
+	renderPin()
+	Configuration.Save()
+	Notifications.Push("Hub", Configuration.Pinned and "Hub fixado." or "Hub solto.")
+end)
+if Configuration.Pinned and Configuration.WinPos then
+	local x, y = clampWin(Configuration.WinPos.x, Configuration.WinPos.y)
+	Win.Position = UDim2.fromOffset(x, y)
+end
+renderPin()
+
+-- Botão quadrado que oculta/mostra o Hub (arrastável). Imagem: arquivo BegABaddiesHubIcon.png, ID do Roblox ou emoji.
+local ToggleBtn = create("ImageButton", {
+	Name = "HubToggle", Size = UDim2.fromOffset(58, 58), Position = UDim2.new(0, 20, 0.2, 0),
+	BackgroundColor3 = Theme.Panel, AutoButtonColor = false, ScaleType = Enum.ScaleType.Crop, ZIndex = 50, Parent = Gui,
+}, { round(14), stroke(Theme.Accent, 2, 0.05) })
+local ToggleFace = create("TextLabel", {
+	Text = "🌸", TextSize = 30, Font = Theme.FontBold, TextColor3 = Theme.Text, BackgroundTransparency = 1,
+	Size = UDim2.fromScale(1, 1), ZIndex = 51, Parent = ToggleBtn,
+})
+function Hub.ApplyIcon()
+	local img
+	pcall(function()
+		if isfile and getcustomasset and isfile("BegABaddiesHubIcon.png") then img = getcustomasset("BegABaddiesHubIcon.png") end
+	end)
+	if not img and Configuration.IconId ~= "" then img = "rbxassetid://" .. Configuration.IconId end
+	ToggleBtn.Image = img or ""
+	ToggleFace.Visible = (img == nil)
+end
+Hub.ApplyIcon()
+do
+	local down, moved, startPos, startAbs = false, false, nil, nil
+	connect(ToggleBtn.InputBegan, function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			down, moved, startPos = true, false, i.Position
+			startAbs = ToggleBtn.AbsolutePosition - Gui.AbsolutePosition
+		end
+	end)
+	connect(UIS.InputChanged, function(i)
+		if down and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - startPos
+			if d.Magnitude > 8 then moved = true end
+			if moved then
+				local vp = Gui.AbsoluteSize
+				ToggleBtn.Position = UDim2.fromOffset(
+					math.clamp(startAbs.X + d.X, 0, vp.X - 58), math.clamp(startAbs.Y + d.Y, 0, vp.Y - 58))
+			end
+		end
+	end)
+	connect(UIS.InputEnded, function(i)
+		if down and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
+			down = false
+			if not moved then Win.Visible = not Win.Visible end
+		end
+	end)
+end
+
+function Hub.Destroy()
+	Hub.Destroyed = true
+	Toggles.Event:Fire()
+	for _, c in ipairs(Hub.Cleanup) do
+		pcall(function()
+			if typeof(c) == "RBXScriptConnection" then c:Disconnect() else c:Destroy() end
+		end)
+	end
+end
+
+--==================================================================
+-- Interface/Notifications
+--==================================================================
+Notifications.Holder = create("Frame", {
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -16), Size = UDim2.fromOffset(290, 400),
+	BackgroundTransparency = 1, Parent = Gui,
+}, {
+	create("UIListLayout", {
+		Padding = UDim.new(0, 8), VerticalAlignment = Enum.VerticalAlignment.Bottom,
+		HorizontalAlignment = Enum.HorizontalAlignment.Right, SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+function Notifications.Push(title, text, kind)
+	if kind ~= "error" and kind ~= "warn" and not Toggles.Get("notifications") then return end
+	local color = (kind == "error" and Theme.Error) or (kind == "warn" and Theme.Warn) or Theme.Accent2
+	local n = create("CanvasGroup", {
+		Size = UDim2.new(1, 0, 0, 58), BackgroundColor3 = Theme.Panel, GroupTransparency = 1,
+		Parent = Notifications.Holder,
+	}, {
+		round(10), stroke(color, 1.2, 0.3),
+		create("Frame", { Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = color, BorderSizePixel = 0 }),
+		create("TextLabel", {
+			Text = title, Font = Theme.FontBold, TextSize = 13, TextColor3 = color, BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(14, 6), Size = UDim2.new(1, -22, 0, 16), TextXAlignment = Enum.TextXAlignment.Left,
+		}),
+		create("TextLabel", {
+			Text = text, Font = Theme.Font, TextSize = 12, TextColor3 = Theme.Text, BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(14, 24), Size = UDim2.new(1, -22, 0, 30), TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		}),
+	})
+	tween(n, 0.25, { GroupTransparency = 0 })
+	task.delay(3.5, function()
+		if n.Parent then
+			tween(n, 0.3, { GroupTransparency = 1 })
+			task.wait(0.35)
+			n:Destroy()
+		end
+	end)
+end
+
+--==================================================================
+-- Interface/MainUI: páginas e componentes
+--==================================================================
+local Pages = {}
+local Page = {}
+Page.__index = Page
+
+local function selectPage(page)
+	for _, p in ipairs(Pages) do
+		p.Frame.Visible = (p == page)
+		tween(p.Tab, 0.2, {
+			BackgroundColor3 = (p == page) and Theme.Accent or Theme.Card,
+			BackgroundTransparency = (p == page) and 0.15 or 0.5,
+		})
+	end
+end
+
+local function newPage(name, icon, plain)
+	local self = setmetatable({ Ids = {}, n = 0 }, Page)
+	self.Frame = create("ScrollingFrame", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Theme.Accent, BorderSizePixel = 0, Visible = false,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), Parent = Content,
+	}, {
+		create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+		create("UIPadding", { PaddingRight = UDim.new(0, 6) }),
+	})
+	if plain then -- página com sub-abas: um Frame simples, não uma lista rolável
+		self.Frame:Destroy()
+		self.Frame = create("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, Parent = Content })
+	end
+	self.Tab = create("TextButton", {
+		Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.Card,
+		BackgroundTransparency = 0.5, LayoutOrder = #Pages, Parent = Sidebar,
+	}, { round(9) })
+	create("TextLabel", {
+		Text = icon .. "  " .. name, Font = Theme.Font, TextSize = 13, TextColor3 = Theme.Text, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -40, 1, 0), TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = self.Tab,
+	})
+	self.Badge = create("TextLabel", {
+		Text = "0", Font = Theme.FontBold, TextSize = 11, TextColor3 = Color3.new(1, 1, 1), BackgroundColor3 = Theme.Accent,
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(22, 18),
+		Visible = false, Parent = self.Tab,
+	}, { round(9) })
+	connect(self.Tab.MouseButton1Click, function() selectPage(self) end)
+	table.insert(Pages, self)
+	if #Pages == 1 then selectPage(self) end
+	Toggles.Listen(function()
+		local c = 0
+		for _, id in ipairs(self.Ids) do if Toggles.Get(id) then c += 1 end end
+		self.Badge.Text, self.Badge.Visible = tostring(c), c > 0
+	end)
+	return self
+end
+
+function Page:Row(h)
+	self.n += 1
+	return create("Frame", {
+		Size = UDim2.new(1, 0, 0, h), BackgroundColor3 = Theme.Card, BackgroundTransparency = 0.25,
+		LayoutOrder = self.n, Parent = self.Frame,
+	}, { round(10), stroke(Theme.Accent, 1, 0.75) })
+end
+
+function Page:Section(text)
+	self.n += 1
+	create("TextLabel", {
+		Text = string.upper(text), Font = Theme.FontBold, TextSize = 11, TextColor3 = Theme.Accent2,
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 18), LayoutOrder = self.n,
+		TextXAlignment = Enum.TextXAlignment.Left, Parent = self.Frame,
+	})
+end
+
+function Page:Info(text)
+	local row = self:Row(math.max(40, 16 * math.ceil(#text / 60) + 14))
+	create("TextLabel", {
+		Text = text, Font = Theme.Font, TextSize = 12, TextColor3 = Theme.Sub, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(12, 4), Size = UDim2.new(1, -24, 1, -8), TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left, Parent = row,
+	})
+end
+
+function Page:Toggle(id, label, desc, default)
+	if Toggles.State[id] == nil then Toggles.State[id] = default or false end
+	table.insert(self.Ids, id)
+	local dh = desc and math.max(52, 32 + 14 * math.ceil(#desc / 56)) or 40
+	local row = self:Row(dh)
+	local dot = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.fromOffset(8, 8),
+		BackgroundColor3 = Theme.Off, Parent = row,
+	}, { round(4) })
+	create("TextLabel", {
+		Text = label, Font = Theme.FontBold, TextSize = 13, TextColor3 = Theme.Text, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(26, desc and 8 or 0), Size = UDim2.new(1, -90, 0, desc and 16 or 40),
+		TextXAlignment = Enum.TextXAlignment.Left, Parent = row,
+	})
+	if desc then
+		create("TextLabel", {
+			Text = desc, Font = Theme.Font, TextSize = 11, TextColor3 = Theme.Sub, BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(26, 25), Size = UDim2.new(1, -90, 0, dh - 30), TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Parent = row,
+		})
+	end
+	local sw = create("TextButton", {
+		Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.fromOffset(44, 22), BackgroundColor3 = Theme.Off, Parent = row,
+	}, { round(11) })
+	local knob = create("Frame", {
+		Size = UDim2.fromOffset(16, 16), Position = UDim2.fromOffset(3, 3), BackgroundColor3 = Color3.new(1, 1, 1), Parent = sw,
+	}, { round(8) })
+	local function render()
+		local on = Toggles.Get(id)
+		tween(sw, 0.18, { BackgroundColor3 = on and Theme.Accent or Theme.Off })
+		tween(knob, 0.18, { Position = on and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3) })
+		tween(dot, 0.18, { BackgroundColor3 = on and Theme.Accent2 or Theme.Off })
+	end
+	connect(sw.MouseButton1Click, function()
+		local on = not Toggles.Get(id)
+		Toggles.Set(id, on)
+		Notifications.Push(label, on and "Ativado" or "Desativado")
+	end)
+	Toggles.Listen(render)
+	render()
+end
+
+function Page:Slider(label, min, max, default, decimals, cb, hint)
+	local row = self:Row(hint and (52 + 14 * math.ceil(#hint / 70)) or 50)
+	if hint then
+		create("TextLabel", {
+			Text = hint, Font = Theme.Font, TextSize = 11, TextColor3 = Theme.Sub, BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 44), Size = UDim2.new(1, -24, 1, -48), TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Parent = row,
+		})
+	end
+	create("TextLabel", {
+		Text = label, Font = Theme.Font, TextSize = 12, TextColor3 = Theme.Text, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(12, 6), Size = UDim2.new(1, -90, 0, 16), TextXAlignment = Enum.TextXAlignment.Left, Parent = row,
+	})
+	local val = create("TextLabel", {
+		Text = tostring(default), Font = Theme.FontBold, TextSize = 12, TextColor3 = Theme.Accent2, BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 6), Size = UDim2.fromOffset(70, 16),
+		TextXAlignment = Enum.TextXAlignment.Right, Parent = row,
+	})
+	local bar = create("Frame", {
+		Position = UDim2.new(0, 12, 0, 32), Size = UDim2.new(1, -24, 0, 6), BackgroundColor3 = Theme.Off, Parent = row,
+	}, { round(3) })
+	local fill = create("Frame", {
+		Size = UDim2.fromScale((default - min) / (max - min), 1), BackgroundColor3 = Theme.Accent, Parent = bar,
+	}, { round(3) })
+	local function set(v)
+		fill.Size = UDim2.fromScale((v - min) / (max - min), 1)
+		val.Text = tostring(v)
+		cb(v)
+	end
+	local function fromX(x)
+		local a = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+		local m = 10 ^ decimals
+		set(math.floor((min + (max - min) * a) * m + 0.5) / m)
+	end
+	local dragging = false
+	connect(bar.InputBegan, function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			fromX(i.Position.X)
+		end
+	end)
+	connect(UIS.InputChanged, function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			fromX(i.Position.X)
+		end
+	end)
+	connect(UIS.InputEnded, function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end)
+	return row
+end
+
+function Page:Input(label, default, placeholder, cb)
+	local row = self:Row(40)
+	create("TextLabel", {
+		Text = label, Font = Theme.Font, TextSize = 12, TextColor3 = Theme.Text, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(12, 0), Size = UDim2.new(0.28, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Left, Parent = row,
+	})
+	local box = create("TextBox", {
+		Text = default or "", PlaceholderText = placeholder or "", PlaceholderColor3 = Theme.Sub, Font = Theme.Font,
+		TextSize = 12, TextColor3 = Theme.Text, ClearTextOnFocus = false, BackgroundColor3 = Theme.Bg,
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.new(0.68, 0, 0, 26),
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row,
+	}, { round(7), stroke(Theme.Accent, 1, 0.6), create("UIPadding", { PaddingLeft = UDim.new(0, 8) }) })
+	connect(box.FocusLost, function() cb(box.Text) end)
+end
+
+function Page:Button(label, cb)
+	local row = self:Row(36)
+	local b = create("TextButton", {
+		Text = label, Font = Theme.FontBold, TextSize = 13, TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = false,
+		BackgroundColor3 = Theme.Accent, Size = UDim2.new(1, -16, 0, 26), Position = UDim2.fromOffset(8, 5), Parent = row,
+	}, { round(8), create("UIGradient", { Color = ColorSequence.new(Theme.Accent, Color3.fromRGB(109, 60, 220)), Rotation = 90 }) })
+	connect(b.MouseButton1Click, function()
+		tween(b, 0.08, { Size = UDim2.new(1, -20, 0, 24) })
+		task.delay(0.1, function() tween(b, 0.12, { Size = UDim2.new(1, -16, 0, 26) }) end)
+		local ok, err = pcall(cb)
+		if not ok then Notifications.Push("Erro", tostring(err), "error") end
+	end)
+end
+
+-- Escolha única entre opções, em botões lado a lado. opts = { { id = "fly", text = "Voando" }, ... }
+function Page:Choice(label, opts, get, set)
+	local row = self:Row(58)
+	create("TextLabel", {
+		Text = label, Font = Theme.FontBold, TextSize = 12, TextColor3 = Theme.Text, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(12, 4), Size = UDim2.new(1, -24, 0, 18),
+		TextXAlignment = Enum.TextXAlignment.Left, Parent = row,
+	})
+	local holder = create("Frame", {
+		Position = UDim2.fromOffset(8, 26), Size = UDim2.new(1, -16, 0, 26), BackgroundTransparency = 1, Parent = row,
+	}, { create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+	}) })
+	local btns = {}
+	local function paint()
+		for id, b in pairs(btns) do
+			tween(b, 0.15, { BackgroundColor3 = (get() == id) and Theme.Accent or Theme.Off })
+		end
+	end
+	for i, o in ipairs(opts) do
+		local b = create("TextButton", {
+			Text = o.text, Font = Theme.FontBold, TextSize = 12, TextColor3 = Theme.Text, AutoButtonColor = false,
+			BackgroundColor3 = Theme.Off, LayoutOrder = i,
+			Size = UDim2.new(1 / #opts, -6 * (#opts - 1) / #opts, 1, 0), Parent = holder,
+		}, { round(8) })
+		btns[o.id] = b
+		connect(b.MouseButton1Click, function()
+			set(o.id)
+			paint()
+		end)
+	end
+	paint()
+	return row
+end
+
+local function Feature(page, id, name, desc, interval, fn)
+	Configuration.Intervals[id] = Configuration.Intervals[id] or interval
+	page:Toggle(id, name, desc, false) -- o intervalo fica na aba "Config. Autofarm"
+	task.spawn(function()
+		while not Hub.Destroyed do
+			if Toggles.Active(id) then
+				local ok, err = pcall(fn)
+				if not ok then Utils.softError(name, err) end
+				local iv = tonumber(Configuration.Intervals[id]) or interval
+				task.wait(math.max(0.03, iv / math.max(0.1, Configuration.Speed)))
+			else
+				Toggles.Event.Event:Wait()
+			end
+		end
+	end)
+end
+
+Toggles.Listen(function()
+	local c = 0
+	for id, v in pairs(Toggles.State) do
+		if v and id ~= "master" and id ~= "notifications" and id ~= "moveto" and id ~= "rarest" then c += 1 end
+	end
+	ActiveLabel.Text = c .. (c == 1 and " função ativa" or " funções ativas")
+end)
+
+--==================================================================
+-- Utilitários de GUI por texto (resgates, auras, níveis, raids)
+--==================================================================
+local CAN_HIDDEN = getconnections ~= nil
+local function cleanLower(t) return ((t or ""):gsub("<[^>]+>", "")):lower() end
+
+-- texto do próprio objeto + de todos os filhos
+function Utils.textOf(g)
+	local t = {}
+	if (g:IsA("TextButton") or g:IsA("TextLabel")) and g.Text ~= "" then t[#t + 1] = g.Text end
+	for _, d in ipairs(g:GetDescendants()) do
+		if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" then t[#t + 1] = d.Text end
+	end
+	return cleanLower(table.concat(t, " "))
+end
+
+-- Templates (clonados pelo jogo), Robux, Premium e Gamepass nunca entram
+function Utils.badPath(node)
+	if Hub.Gui and node:IsDescendantOf(Hub.Gui) then return true end
+	local cur = node
+	while cur and cur ~= game do
+		local l = cur.Name:lower()
+		if l == "templates" or l:find("robux") or l:find("premium") or l:find("gamepass") then return true end
+		cur = cur.Parent
+	end
+	return false
+end
+
+local textCache = setmetatable({}, { __mode = "k" })
+-- Todos os botões da GUI: { btn, text, shown }. Com allowHidden, inclui painéis fechados (se o executor tem getconnections).
+function Utils.buttons(allowHidden)
+	local out = {}
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if not pg then return out end
+	for _, g in ipairs(pg:GetDescendants()) do
+		if g:IsA("GuiButton") and not Utils.badPath(g) then
+			local shown = Utils.shown(g)
+			if shown or (allowHidden and CAN_HIDDEN) then
+				local c = textCache[g]
+				if not (c and os.clock() - c.t < 0.8) then
+					c = { text = Utils.textOf(g), t = os.clock() }
+					textCache[g] = c
+				end
+				out[#out + 1] = { btn = g, text = c.text, shown = shown }
+			end
+		end
+	end
+	return out
+end
+
+-- "$1.78B" / "$11.2T" -> número
+function Utils.parsePrice(text)
+	local num, unit = text:match("%$%s*([%d%.,]+)%s*(%a*)")
+	if not num then return nil end
+	num = tonumber((num:gsub(",", "")))
+	if not num then return nil end
+	return num * (INCOME_UNITS[unit:lower()] or 1)
+end
+
+-- Seu dinheiro: lê o contador do canto inferior esquerdo da tela (melhor esforço; nil se não achar)
+local moneyAt, moneyV = 0, nil
+function Utils.money()
+	if os.clock() - moneyAt < 1 then return moneyV end
+	moneyAt = os.clock()
+	moneyV = nil
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+	if pg then
+		for _, g in ipairs(pg:GetDescendants()) do
+			if g:IsA("TextLabel") and g.Text:find("%$") and Utils.shown(g) and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) then
+				local t = cleanLower(g.Text):gsub("%s", "")
+				if t:match("^%$[%d%.,]+%a*$") then
+					local p = g.AbsolutePosition
+					if p.X < vp.X * 0.35 and p.Y > vp.Y * 0.6 then
+						moneyV = Utils.parsePrice(t)
+						break
+					end
+				end
+			end
+		end
+	end
+	return moneyV
+end
+
+function Utils.scrollInto(btn)
+	local sf = btn:FindFirstAncestorOfClass("ScrollingFrame")
+	if not (sf and Utils.shown(btn)) then return end
+	local top, by = sf.AbsolutePosition.Y, btn.AbsolutePosition.Y
+	if by < top or by + btn.AbsoluteSize.Y > top + sf.AbsoluteSize.Y then
+		local target = sf.CanvasPosition.Y + (by - top) - (sf.AbsoluteSize.Y - btn.AbsoluteSize.Y) / 2
+		sf.CanvasPosition = Vector2.new(sf.CanvasPosition.X, math.max(0, target))
+		task.wait(0.1)
+	end
+end
+
+local function dumpText(title, lines)
+	if #lines == 0 then lines[1] = "Nada encontrado. Abra o painel correspondente e tente de novo." end
+	local text = title .. "\n" .. table.concat(lines, "\n")
+	print(text)
+	if setclipboard then pcall(setclipboard, text) end
+	Notifications.Push(title, #lines .. " linhas" .. (setclipboard and " copiadas." or " no console."))
+end
+
+-- Prioridade entre funções que disputam o mesmo alvo: Raid > Fendas > Talk/Coleta
+function Utils.takeOver(id, keywords)
+	if Lock.target and Lock.id ~= id and Lock.id ~= "raid" and not Mini.active and not Utils.findBeg()
+		and Utils.pickTarget(keywords, nil, false) then
+		release()
+	end
+end
+
+-- Prompt do "pad" do centro da raid: o mais próximo de você (ignora NPCs/lojas). Usado logo após viajar.
+local PAD_BAD = { "shop", "loja", "robux", "store", "premium", "gamepass" }
+function Utils.firePad(radius)
+	if not fireproximityprompt then return false end
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return false end
+	local best, bd
+	for p in pairs(Prompts) do
+		if p.Enabled and p:IsDescendantOf(workspace) and not Utils.isBlacklisted(p) and not npcPrompt(p) then
+			local txt = (p.ObjectText .. " " .. p.ActionText .. " " .. p:GetFullName()):lower()
+			local part = p.Parent
+			if part and part:IsA("Attachment") then part = part.Parent end
+			if part and part:IsA("BasePart") and not matches(txt, PAD_BAD) then
+				local d = (hrp.Position - part.Position).Magnitude
+				if d <= radius and (not bd or d < bd) then best, bd = p, d end
+			end
+		end
+	end
+	if not best then return false end
+	pcall(function()
+		best.HoldDuration = 0
+		best.RequiresLineOfSight = false
+	end)
+	Utils.wakeKeyboard()
+	fireproximityprompt(best)
+	return true, best
+end
+
+--==================================================================
+-- Modules
+--==================================================================
+local Modules = {}
+
+Modules.Missions = { Name = "Missões", Icon = "🎯", Init = function(page)
+	page:Section("Missões")
+	Feature(page, "mission_collect", "Auto Collect Missions",
+		"Vai até prompts de missão/coleta (mais raro primeiro) e fica até sumirem.", 0.5, function()
+			Utils.interact("mission_collect", Configuration.Keywords.MissionCollect)
+		end)
+	Feature(page, "mission_complete", "Auto Complete Missions",
+		"Envia a conclusão ao Remote configurado (e a cada missão da pasta, se definida).", 2, function()
+			local remote = Utils.need("mission_complete", "MissionComplete")
+			if not remote then return end
+			local folder = Utils.resolve(Configuration.Paths.MissionFolder)
+			if folder then
+				for _, m in ipairs(folder:GetChildren()) do
+					if not Toggles.Active("mission_complete") then break end
+					Utils.call(remote, Configuration.Builders.MissionComplete(m))
+				end
+			else
+				Utils.call(remote, Configuration.Builders.MissionComplete())
+			end
+		end)
+
+	page:Section("Resgatar tudo")
+	local CLAIM = { "resgatar", "reclamar", "claim", "coletar", "collect", "receber" }
+	local CLAIM_BAD = {
+		"código", "codigo", "code", "insira", "robux", "r$", "comprar", "buy",
+		"claimed", "resgatado", "reclamado", "coletado", "collected", "feito", "done", "usado",
+	}
+	-- botão "Resgatar" do campo de código (fica junto de um TextBox): nunca clica
+	local function nearTextBox(b)
+		local p = b.Parent
+		for _ = 1, 2 do
+			if not p then break end
+			if #p:GetChildren() <= 4 and p:FindFirstChildWhichIsA("TextBox", true) then return true end
+			p = p.Parent
+		end
+		return false
+	end
+	local function claimables()
+		local out = {}
+		for _, e in ipairs(Utils.buttons(Configuration.ClaimHidden)) do
+			local t = e.text
+			if matches(t, CLAIM) and not matches(t, CLAIM_BAD)
+				and not t:find("%d+m%s*%d+s") and not t:find("%d+:%d%d") and not nearTextBox(e.btn) then
+				e.all = (t:find("todos", 1, true) or t:find("all", 1, true)) and 0 or 1
+				table.insert(out, e)
+			end
+		end
+		table.sort(out, function(a, b) return a.all < b.all end)
+		return out
+	end
+	local lastClaim = setmetatable({}, { __mode = "k" })
+	Feature(page, "claim_all", "Auto Resgatar (Tarefas, Recompensas, Conquistas)",
+		"Clica em todos os 'Resgatar / Reclamar' (Tarefas, Solicitações, Recompensas, Conquistas, Resgatar Todos). Ignora o campo de código.",
+		1.5, function()
+			for _, e in ipairs(claimables()) do
+				if not Toggles.Active("claim_all") then break end
+				local btn = e.btn
+				if btn.Parent and os.clock() - (lastClaim[btn] or 0) >= 1.5 then
+					lastClaim[btn] = os.clock()
+					Utils.scrollInto(btn)
+					Utils.clickGui(btn, not Utils.shown(btn))
+					task.wait(0.15)
+				end
+			end
+		end)
+	page:Button("Escanear resgates (o que ele clicaria)", function()
+		local out = {}
+		for _, e in ipairs(claimables()) do
+			table.insert(out, ("%s | texto='%s' | %s"):format(e.shown and "VISÍVEL" or "FECHADO", e.text:sub(1, 40), e.btn:GetFullName()))
+		end
+		dumpText("Scan de resgates", out)
+	end)
+end }
+
+Modules.Conversations = { Name = "Conversas", Icon = "💬", Init = function(page)
+	page:Section("Conversas")
+	Feature(page, "talk", "Auto Talk (Beg!)",
+		"Vai ao Baddie mais raro, abre a conversa, aperta BEG! e repete a cada tentativa (o Beg acerta o perfeito).", 0.3, function()
+			Utils.begStep("talk", Configuration.Keywords.Talk, Configuration.Keywords.Buddy, true)
+		end)
+	Feature(page, "talk_buddy", "Auto Talk Buddies", "Interage com o Buddy mais próximo e aperta BEG!.", 0.3, function()
+		Utils.begStep("talk_buddy", Configuration.Keywords.Buddy, nil, false)
+	end)
+
+	page:Section("Nunca ir em (bloqueados)")
+	page:Info("Personagens desta lista NUNCA são escolhidos como alvo. Separe por vírgula. Basta o nome aparecer no prompt, no modelo ou no texto sobre o personagem.")
+	page:Input("Bloquear", table.concat(Configuration.Blacklist, ", "), "ex.: ember sage, recruiter", function(t)
+		local list = {}
+		for w in (t or ""):gmatch("[^,]+") do
+			w = w:gsub("^%s+", ""):gsub("%s+$", ""):lower()
+			if w ~= "" then table.insert(list, w) end
+		end
+		Configuration.Blacklist = list
+		Configuration.Save()
+		Notifications.Push("Bloqueio", #list .. " nomes bloqueados.")
+	end)
+	page:Button("Bloquear o personagem mais próximo", function()
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then error("Personagem não encontrado") end
+		local best, bd
+		for p in pairs(Prompts) do
+			local part = p.Parent
+			if part and part:IsA("Attachment") then part = part.Parent end
+			if part and part:IsA("BasePart") and p:FindFirstAncestorOfClass("Model") then
+				local d = (hrp.Position - part.Position).Magnitude
+				if not bd or d < bd then best, bd = p, d end
+			end
+		end
+		if not best then error("Nenhum personagem por perto") end
+		local name = best:FindFirstAncestorOfClass("Model").Name:lower()
+		table.insert(Configuration.Blacklist, name)
+		Configuration.Save()
+		Notifications.Push("Bloqueio", "'" .. name .. "' adicionado à lista (reabra o hub para ver no campo).")
+	end)
+
+	page:Info("Escolha as raridades na aba Raridades. Fique perto dos Baddies (o jogo só carrega o que está por perto) e deixe 'Beg' ligado na aba Movimento.")
+end }
+
+Modules.Rarities = { Name = "Raridades", Icon = "💎", Init = function(page)
+	local COLORS = {
+		common = Color3.fromRGB(190, 190, 205), uncommon = Color3.fromRGB(90, 220, 110),
+		rare = Color3.fromRGB(70, 140, 255), epic = Color3.fromRGB(170, 90, 255),
+		legendary = Color3.fromRGB(255, 180, 50), mythic = Color3.fromRGB(235, 50, 70),
+		exotic = Color3.fromRGB(255, 130, 40), divine = Color3.fromRGB(255, 235, 150),
+		secret = Color3.fromRGB(245, 245, 245), exclusive = Color3.fromRGB(255, 90, 200),
+		celestial = Color3.fromRGB(130, 180, 255),
+	}
+	page:Section("Prioridade por raridade")
+	page:Info("Mesma ordem do Index: em cima = menos raro, embaixo = MAIS raro. Toque para marcar. Ele vai sempre no mais raro das marcadas. Nenhuma marcada = vai em todas, do mais raro pro menos.")
+	local holder = page:Row(40)
+	create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = holder })
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
+		PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = holder,
+	})
+	local function build()
+		for _, c in ipairs(holder:GetChildren()) do
+			if c:IsA("TextButton") then c:Destroy() end
+		end
+		holder.Size = UDim2.new(1, 0, 0, 12 + #Configuration.RarityOrder * 32)
+		for i, name in ipairs(Configuration.RarityOrder) do
+			local key = name:lower()
+			local color = COLORS[key] or Theme.Accent2
+			local btn = create("TextButton", {
+				Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 26),
+				BackgroundColor3 = Theme.Bg, LayoutOrder = i, Parent = holder,
+			}, { round(8) })
+			create("Frame", {
+				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0), Size = UDim2.fromOffset(10, 10),
+				Rotation = 45, BackgroundColor3 = color, BorderSizePixel = 0, Parent = btn,
+			})
+			create("TextLabel", {
+				Text = name:sub(1, 1):upper() .. name:sub(2), Font = Theme.FontBold, TextSize = 13, TextColor3 = color, BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(32, 0), Size = UDim2.new(0.5, 0, 1, 0),
+				TextXAlignment = Enum.TextXAlignment.Left, Parent = btn,
+			})
+			local state = create("TextLabel", {
+				Text = "", Font = Theme.FontBold, TextSize = 11, TextColor3 = Theme.Text, BackgroundTransparency = 1,
+				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(110, 20),
+				TextXAlignment = Enum.TextXAlignment.Right, Parent = btn,
+			})
+			local function paint()
+				local on = Configuration.RarityFilter[key]
+				tween(btn, 0.15, { BackgroundColor3 = on and Theme.Accent or Theme.Bg })
+				state.Text = on and "✔ PRIORIZAR" or "—"
+			end
+			connect(btn.MouseButton1Click, function()
+				Configuration.RarityFilter[key] = (not Configuration.RarityFilter[key]) or nil
+				paint()
+				Configuration.Save()
+			end)
+			paint()
+		end
+	end
+	build()
+	page:Slider("Só as marcadas (1) ou marcadas primeiro (0)", 0, 1, Configuration.StrictRarity and 1 or 0, 0, function(v)
+		Configuration.StrictRarity = v >= 1
+	end)
+	page:Button("Marcar todas", function()
+		for _, name in ipairs(Configuration.RarityOrder) do Configuration.RarityFilter[name:lower()] = true end
+		build()
+		Configuration.Save()
+	end)
+	page:Button("Limpar seleção", function()
+		for k in pairs(Configuration.RarityFilter) do Configuration.RarityFilter[k] = nil end
+		build()
+		Configuration.Save()
+	end)
+end }
+
+Modules.Raids = { Name = "Raids", Icon = "🐉", Init = function(page)
+	local DIFF = {
+		easy = { "fácil", "facil", "easy" },
+		normal = { "normal", "medium", "médio", "medio" },
+		hard = { "difícil", "dificil", "hard" },
+	}
+	local ALLDIFF = {}
+	for _, l in pairs(DIFF) do for _, w in ipairs(l) do table.insert(ALLDIFF, w) end end
+	local BEST = { "melhor", "best", "auto", "equip best" }
+	local BEST_BAD = { "movimento", "move", "casa", "house", "sell", "vender", "exclus" }
+	local START = { "iniciar", "start", "começar", "comecar", "begin", "lutar", "fight" }
+	local LOCKED = { "bloquead", "locked", "🔒" }
+	local ENTRY = { "raid", "incurs", "invas" }
+	local ENTRY_BTN = { "invas", "incurs" } -- aviso "Vá para a invasão"
+	local OPEN = { "open", "aberto", "aberta" } -- botão RAIDS do menu Viagem: "... raid OPEN · 0:23"
+	local ENTRY_BAD = { "shop", "loja", "store", "mercado" }
+	local CLOSING = { "fecha", "closes", "closing" } -- botão da fenda: "Fenda ... fecha em 0:13"
+
+	-- clica num botão do menu Viagem: painel aberto = clique normal; fechado = dispara o botão (ou tenta abrir o menu)
+	local function openTravel()
+		for _, e in ipairs(Utils.buttons(false)) do
+			local n = e.btn.Name:lower()
+			if n:find("travel", 1, true) or n:find("viagem", 1, true) or n:find("teleport", 1, true)
+				or n:find("warp", 1, true) or n:find("portal", 1, true) then
+				Utils.clickGui(e.btn)
+				return true
+			end
+		end
+		return false
+	end
+	local function goTravel(e)
+		if e.shown then
+			Utils.clickGui(e.btn)
+			return true
+		end
+		if Utils.clickGui(e.btn, true) then return true end
+		if openTravel() then task.wait(0.8) end
+		return false
+	end
+
+	page:Section("Raid (centro vermelho/azul)")
+	page:Choice("Dificuldade", {
+		{ id = "easy", text = "Fácil" }, { id = "normal", text = "Normal" }, { id = "hard", text = "Difícil" },
+	}, function() return Configuration.RaidDifficulty end, function(v)
+		Configuration.RaidDifficulty = v
+		Configuration.Save()
+	end)
+	local st = { diff = false, best = false, lastStart = 0, lastEntry = 0, goneAt = 0, padUntil = 0, lastPad = 0 }
+
+	-- raiz do diálogo: ancestral (até 6 níveis) que fala de dificuldade/raid
+	local function dialogRoot(btn)
+		local a = btn.Parent
+		for _ = 1, 6 do
+			if not (a and a:IsA("GuiObject")) then break end
+			local t = Utils.textOf(a)
+			if t:find("dificuldade", 1, true) or t:find("difficulty", 1, true) or (matches(t, ENTRY) and matches(t, ALLDIFF)) then
+				return a
+			end
+			a = a.Parent
+		end
+		return nil
+	end
+
+	local function analyzeDialog(list)
+		for _, e in ipairs(list) do
+			if e.shown and matches(e.text, START) and not matches(e.text, BEST_BAD) then
+				local root = dialogRoot(e.btn)
+				if root then
+					local d = { root = root, start = e.btn }
+					for _, o in ipairs(list) do
+						if o.shown and o.btn ~= e.btn and o.btn:IsDescendantOf(root) then
+							if not d.diff and matches(o.text, DIFF[Configuration.RaidDifficulty]) and not matches(o.text, LOCKED) then
+								d.diff = o.btn
+							end
+							if not d.best and matches(o.text, BEST) and not matches(o.text, BEST_BAD) then
+								d.best = o.btn
+							end
+						end
+					end
+					return d
+				end
+			end
+		end
+		return nil
+	end
+
+	Feature(page, "raid", "Auto Raid",
+		"Quando a raid abre (menu Viagem mostra OPEN): viaja até o centro, interage, escolhe a dificuldade, seleciona os melhores e inicia.",
+		0.6, function()
+			local list = Utils.buttons(true)
+			local d = analyzeDialog(list)
+			if d then
+				st.goneAt, st.padUntil = os.clock(), 0
+				if not st.diff then
+					if d.diff then Utils.clickGui(d.diff) task.wait(Configuration.RaidWaitDiff) end
+					st.diff = true
+				elseif not st.best then
+					if d.best then Utils.clickGui(d.best) task.wait(Configuration.RaidWaitBest) end
+					st.best = true
+				elseif os.clock() - st.lastStart >= Configuration.RaidStartEvery then
+					st.lastStart = os.clock()
+					Utils.clickGui(d.start)
+				end
+				return
+			end
+			if os.clock() - st.goneAt > 4 then st.diff, st.best = false, false end
+
+			-- 1) a raid abriu: viaja (botão RAIDS "OPEN" do menu Viagem ou aviso "Vá para a invasão")
+			if os.clock() >= st.padUntil and os.clock() - st.lastEntry >= Configuration.RaidEntryEvery then
+				for _, e in ipairs(list) do
+					local t = e.text
+					local opened = t:find("raid", 1, true) and matches(t, OPEN)
+					local banner = matches(t, ENTRY_BTN) and not t:find("%d+:%d%d") and not t:find("%d+m%s*%d+s")
+					if (opened or banner) and not matches(t, ENTRY_BAD) and not matches(t, LOCKED) then
+						st.lastEntry = os.clock()
+						if goTravel(e) then
+							st.padUntil = os.clock() + 45 -- agora estou no centro: procura o prompt do pad
+							Notifications.Push("Raid", "Viajando para o centro da raid.")
+						end
+						return
+					end
+				end
+			end
+
+			-- 2) no centro: interage com o prompt do pad (o mais próximo de você)
+			if os.clock() < st.padUntil and os.clock() - st.lastPad >= 2 then
+				st.lastPad = os.clock()
+				if Utils.firePad(Configuration.RaidPadRadius) then return end
+			end
+
+			-- 3) prompt de raid em qualquer lugar do mapa (raid tem prioridade)
+			Utils.takeOver("raid", Configuration.Keywords.Raid)
+			Utils.interact("raid", Configuration.Keywords.Raid, nil, false)
+		end)
+
+	page:Section("Fendas (Fenda Climática, Water Rift...)")
+	local visited = {}
+	Feature(page, "rift", "Auto Fendas",
+		"Quando uma fenda abre, viaja até ela pelo menu Viagem e interage com o prompt da fenda perto de você.",
+		0.8, function()
+			local list = Utils.buttons(true)
+			for _, e in ipairs(list) do
+				local t = e.text
+				if matches(t, Configuration.Keywords.Rift) and matches(t, CLOSING) and not matches(t, ENTRY_BAD) then
+					local key = (t:gsub("%d+:%d+", ""):gsub("%s+", " "))
+					if not (visited[key] and os.clock() < visited[key]) then
+						if goTravel(e) then
+							visited[key] = os.clock() + Configuration.RiftCooldown
+							Notifications.Push("Fenda", "Viajando até a fenda.")
+						end
+						return
+					end
+				end
+			end
+			-- já na fenda: só prompts de fenda perto de você (nunca a base dos outros)
+			Utils.takeOver("rift", Configuration.Keywords.Rift)
+			if Lock.id and Lock.id ~= "rift" then return end
+			Utils.interact("rift", Configuration.Keywords.Rift, nil, false)
+		end)
+
+	page:Info("Tempos e distâncias estão em 'Config. Autofarm'. Se algo não funcionar, abra o menu Viagem e use os botões de escanear abaixo, depois me mande o texto.")
+	page:Button("Escanear Raid (botões e prompts)", function()
+		local out = {}
+		for _, e in ipairs(Utils.buttons(true)) do
+			local t = e.text
+			if matches(t, ENTRY) or matches(t, ALLDIFF) or matches(t, START) or matches(t, BEST) then
+				table.insert(out, ("%s | '%s' | %s"):format(e.shown and "VISÍVEL" or "FECHADO", t:sub(1, 60), e.btn:GetFullName()))
+			end
+		end
+		for p in pairs(Prompts) do
+			local txt = (p.ObjectText .. " " .. p.ActionText .. " " .. p:GetFullName()):lower()
+			if matches(txt, ENTRY) then
+				table.insert(out, ("prompt ativo=%s | '%s' '%s' | %s"):format(tostring(p.Enabled), p.ObjectText, p.ActionText, p:GetFullName()))
+			end
+		end
+		dumpText("Scan da Raid", out)
+	end)
+	page:Button("Escanear prompts do centro (fique em cima do pad)", function()
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		local out = {}
+		if hrp then
+			for p in pairs(Prompts) do
+				local part = p.Parent
+				if part and part:IsA("Attachment") then part = part.Parent end
+				if part and part:IsA("BasePart") then
+					local d = (hrp.Position - part.Position).Magnitude
+					if d <= 60 then
+						table.insert(out, ("%.0f studs | ativo=%s | '%s' '%s' | %s"):format(
+							d, tostring(p.Enabled), p.ObjectText, p.ActionText, p:GetFullName()))
+					end
+				end
+			end
+		end
+		dumpText("Prompts a 60 studs", out)
+	end)
+	page:Button("Escanear Fendas (botões e prompts)", function()
+		local out = {}
+		for _, e in ipairs(Utils.buttons(true)) do
+			if matches(e.text, Configuration.Keywords.Rift) then
+				table.insert(out, ("%s | '%s' | %s"):format(e.shown and "VISÍVEL" or "FECHADO", e.text:sub(1, 60), e.btn:GetFullName()))
+			end
+		end
+		for p in pairs(Prompts) do
+			local txt = (p.ObjectText .. " " .. p.ActionText .. " " .. p:GetFullName()):lower()
+			if matches(txt, Configuration.Keywords.Rift) then
+				table.insert(out, ("prompt ativo=%s | '%s' '%s' | %s"):format(tostring(p.Enabled), p.ObjectText, p.ActionText, p:GetFullName()))
+			end
+		end
+		dumpText("Scan de Fendas", out)
+	end)
+end }
+
+Modules.Combat = { Name = "Combate", Icon = "⚔️", Init = function(page)
+	page:Section("Beg (minigame do evento)")
+	page:Toggle("perfect", "Beg",
+		"Fica ligado: acha a zona vermelha (onde estiver) e aperta E quando o risco branco passa nela. Ajustes na aba 'Config. Autofarm'.", true)
+
+	local manual = { marker = nil, line = nil, t = 0 }
+	local auto = { zone = nil, marker = nil, samples = {}, roots = nil, rootsAt = 0, t = 0 }
+	local prev, velS, moveAt, stale, beat = nil, 0, 0, false, nil
+	local roundState = { presses = 0, last = 0 }
+
+	local function manualParts()
+		if not (manual.marker and manual.marker.Parent and manual.line and manual.line.Parent) then
+			if os.clock() - manual.t < 0.25 then return nil end
+			manual.t = os.clock()
+			manual.marker = Utils.resolve(Configuration.Paths.PerfectMarker)
+			manual.line = Utils.resolve(Configuration.Paths.PerfectLine)
+		end
+		if manual.marker and manual.line and manual.marker:IsA("GuiObject") and manual.line:IsA("GuiObject") then
+			return manual.marker, manual.line
+		end
+		return nil
+	end
+
+	-- sobreposição no eixo perpendicular ao movimento (o risco atravessa a barra)
+	local function overlap(horiz, a, b)
+		if horiz then
+			return a.AbsolutePosition.Y < b.AbsolutePosition.Y + b.AbsoluteSize.Y
+				and b.AbsolutePosition.Y < a.AbsolutePosition.Y + a.AbsoluteSize.Y
+		end
+		return a.AbsolutePosition.X < b.AbsolutePosition.X + b.AbsoluteSize.X
+			and b.AbsolutePosition.X < a.AbsolutePosition.X + a.AbsoluteSize.X
+	end
+
+	local function isPressText(g)
+		local t = g.Text:lower()
+		return t:find("pressione e", 1, true) ~= nil or t:find("press e", 1, true) ~= nil
+			or t:find("na zona", 1, true) ~= nil or t:find("in the zone", 1, true) ~= nil
+	end
+
+	-- Acha o PAINEL do minigame: pelo texto "Pressione E ..." (visível). Sem texto, pelos ancestrais das GUIs vermelhas.
+	local function collectRoots(pg)
+		local roots, seen, reds = {}, {}, {}
+		local function add(r)
+			if r and r ~= pg and r:IsA("GuiObject") and not seen[r] then
+				seen[r] = true
+				table.insert(roots, r)
+			end
+		end
+		for _, g in ipairs(pg:GetDescendants()) do
+			if g:IsA("GuiObject") and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) then
+				if (g:IsA("TextLabel") or g:IsA("TextButton")) and g.Text ~= "" and isPressText(g) and Utils.shown(g) then
+					local a = g.Parent
+					for _ = 1, 3 do add(a) a = a and a.Parent end
+				elseif g.AbsoluteSize.X > 4 and g.AbsoluteSize.Y > 4 and Utils.isRed(g) and Utils.shown(g) then
+					table.insert(reds, g)
+				end
+			end
+		end
+		if #roots == 0 then
+			for _, g in ipairs(reds) do
+				local a = g.Parent
+				for _ = 1, 4 do add(a) a = a and a.Parent end
+			end
+		end
+		return roots
+	end
+
+	-- Dentro do painel: zona vermelha (maior primeiro) + objeto mais estreito que ela, no mesmo trecho da barra,
+	-- que se MOVE. Se vários se movem (risco e estrela), usa o mais fino.
+	local function scanRoots(roots, samples)
+		local newSamples = {}
+		for _, root in ipairs(roots) do
+			local desc = root:GetDescendants()
+			local reds = {}
+			for _, g in ipairs(desc) do
+				if g:IsA("GuiObject") and g.AbsoluteSize.X > 4 and g.AbsoluteSize.Y > 4 and Utils.isRed(g) and Utils.shown(g) then
+					table.insert(reds, g)
+				end
+			end
+			table.sort(reds, function(a, b)
+				return a.AbsoluteSize.X * a.AbsoluteSize.Y > b.AbsoluteSize.X * b.AbsoluteSize.Y
+			end)
+			for _, g in ipairs(reds) do
+				local horiz = g.AbsoluteSize.X >= g.AbsoluteSize.Y
+				local limit = (horiz and g.AbsoluteSize.X or g.AbsoluteSize.Y) * 0.8
+				local best, bestW
+				for _, d in ipairs(desc) do
+					if d ~= g and d:IsA("GuiObject") and d.AbsoluteSize.X > 0 and d.AbsoluteSize.Y > 0
+						and not d:IsDescendantOf(g) and not g:IsDescendantOf(d) then
+						local w = horiz and d.AbsoluteSize.X or d.AbsoluteSize.Y
+						if w <= limit and overlap(horiz, g, d) and Utils.shown(d) then
+							local pos = d.AbsolutePosition
+							local old = samples[d]
+							if old and (horiz and math.abs(pos.X - old.X) or math.abs(pos.Y - old.Y)) > 0.5 then
+								if not best or w < bestW then best, bestW = d, w end
+							end
+							newSamples[d] = pos
+						end
+					end
+				end
+				if best then return g, best, {} end
+			end
+		end
+		return nil, nil, newSamples
+	end
+
+	local function autoParts(dt)
+		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		if not pg then return nil end
+		if auto.zone then
+			if auto.zone:IsDescendantOf(pg) and auto.marker:IsDescendantOf(pg)
+				and Utils.shown(auto.zone) and Utils.shown(auto.marker) and Utils.isRed(auto.zone) then
+				return auto.marker, auto.zone
+			end
+			auto.zone, auto.marker, auto.samples = nil, nil, {}
+		end
+		auto.t += dt
+		-- com o painel já localizado varre todo frame (barato); sem ele, só de vez em quando
+		local need = auto.roots and 0 or ((os.clock() < Mini.windowUntil) and 0.1 or 0.5)
+		if auto.t < need then return nil end
+		auto.t = 0
+		if auto.roots and not (auto.roots[1] and auto.roots[1].Parent and Utils.shown(auto.roots[1])) then
+			auto.roots, auto.samples = nil, {}
+		end
+		if not auto.roots then
+			local r = collectRoots(pg)
+			if #r > 0 then auto.roots, auto.rootsAt, auto.samples = r, os.clock(), {} end
+		end
+		if not auto.roots then return nil end
+		local z, m, s = scanRoots(auto.roots, auto.samples)
+		if z then
+			auto.zone, auto.marker, auto.samples = z, m, {}
+			return m, z
+		end
+		auto.samples = s
+		if os.clock() - auto.rootsAt > 1.5 then auto.roots = nil end -- repesquisa o painel
+		return nil
+	end
+
+	local function keyByName(name)
+		local ok, key = pcall(function() return Enum.KeyCode[name] end)
+		if ok and key then return key end
+		ok, key = pcall(function() return Enum.KeyCode[name:upper()] end)
+		return ok and key or nil
+	end
+
+	-- E em duas camadas: evento de teclado virtual + chamada direta dos scripts que escutam InputBegan.
+	-- A segunda funciona mesmo quando o jogo está em "modo toque" e ignora o teclado virtual.
+	local function pressKey(key)
+		pcall(function() VIM:SendKeyEvent(true, key, false, game) end)
+		if Configuration.DirectInput and getconnections then
+			local fake = {
+				KeyCode = key, UserInputType = Enum.UserInputType.Keyboard,
+				UserInputState = Enum.UserInputState.Begin, Position = Vector3.zero, Delta = Vector3.zero,
+			}
+			pcall(function()
+				for _, c in ipairs(getconnections(UIS.InputBegan)) do
+					pcall(function() c:Fire(fake, false) end)
+				end
+			end)
+		end
+		task.wait(0.06)
+		pcall(function() VIM:SendKeyEvent(false, key, false, game) end)
+	end
+
+	local function hit(pos, gui)
+		local remote = Utils.resolve(Configuration.Paths.PerfectRemote)
+		if remote then
+			Utils.call(remote, Configuration.Builders.Perfect())
+			return
+		end
+		for part in Configuration.PerfectKey:gmatch("[^%+]+") do
+			part = part:gsub("%s", "")
+			if part:lower() == "click" then
+				Utils.clickAt(pos, gui)
+			else
+				local key = keyByName(part)
+				if not key then error("Tecla inválida: " .. tostring(part)) end
+				pressKey(key)
+			end
+		end
+	end
+
+	local function between(a, b, c) return (a - c) * (b - c) <= 0 end
+
+	local function step(dt)
+		local usingManual = Configuration.Paths.PerfectMarker ~= "" and Configuration.Paths.PerfectLine ~= ""
+		local marker, line
+		if usingManual then marker, line = manualParts() else marker, line = autoParts(dt) end
+		if not (marker and line and Utils.shown(marker) and Utils.shown(line)) then
+			prev, velS, stale = nil, 0, false
+			Mini.active = false
+			return
+		end
+		local horiz = line.AbsoluteSize.X >= line.AbsoluteSize.Y
+		local m = marker.AbsolutePosition + marker.AbsoluteSize / 2
+		local l = line.AbsolutePosition + line.AbsoluteSize / 2
+		local mc, lc = horiz and m.X or m.Y, horiz and l.X or l.Y
+		local moved = (prev == nil) or math.abs(mc - prev) > 0.3
+		if moved then moveAt = os.clock() end
+		if stale then
+			if not moved then prev = mc return end -- barra parada (resultado na tela): ignora
+			stale = false
+		end
+		if not Mini.active then
+			Mini.count += 1
+			roundState.presses, roundState.last, moveAt = 0, 0, os.clock()
+			task.spawn(Utils.wakeKeyboard)
+		end
+		Mini.active, Mini.seen = true, true
+		if os.clock() - moveAt > 2.5 then
+			stale, Mini.active, prev = true, false, mc
+			return
+		end
+		local half = (horiz and line.AbsoluteSize.X or line.AbsoluteSize.Y) / 2
+		local k = 1 - Configuration.PerfectPoint
+		local pad = Configuration.PerfectTolerance
+		local vel = prev and (mc - prev) / math.max(dt, 0.001) or 0
+		velS = velS * 0.6 + vel * 0.4
+		local pred = mc + velS * Configuration.PerfectLead
+		local onLine = math.abs(pred - lc) <= half * k + pad
+		local crossed = false
+		-- risco rápido pode "pular" o vermelho entre dois frames: detecta o cruzamento do centro
+		if prev and not onLine and math.abs(mc - prev) > 0.5 and between(prev, mc, lc) then crossed = true end
+		prev = mc
+		if (onLine or crossed) and roundState.presses < Configuration.PerfectPresses
+			and os.clock() - roundState.last >= Configuration.PerfectCooldown then
+			roundState.presses += 1
+			roundState.last = os.clock()
+			task.spawn(function()
+				local ok, err = pcall(hit, l, line)
+				if not ok then
+					Utils.softError("Beg", err)
+				end
+			end)
+		end
+	end
+
+	local function sync()
+		local want = Toggles.Active("perfect") and not Hub.Destroyed
+		if want and not beat then
+			beat = RunService.Heartbeat:Connect(function(dt)
+				local ok, err = pcall(step, dt)
+				if not ok then
+					Utils.softError("Beg", err)
+				end
+			end)
+		elseif not want and beat then
+			beat:Disconnect()
+			beat, prev, Mini.active = nil, nil, false
+		end
+	end
+	Toggles.Listen(sync)
+	table.insert(Hub.Cleanup, { Destroy = function() if beat then beat:Disconnect() beat = nil end end })
+	sync()
+end }
+
+Modules.Spins = { Name = "Spins", Icon = "🎰", Init = function(page)
+	page:Section("Spins")
+	Feature(page, "spin_class", "Auto Class Spin", "Dispara o Remote de spin de classe.", 1.5, function()
+		local r = Utils.need("spin_class", "ClassSpin")
+		if r then Utils.call(r, Configuration.Builders.ClassSpin()) end
+	end)
+	Feature(page, "spin_passive", "Auto Passive Spin", "Dispara o Remote de spin de passiva.", 1.5, function()
+		local r = Utils.need("spin_passive", "PassiveSpin")
+		if r then Utils.call(r, Configuration.Builders.PassiveSpin()) end
+	end)
+end }
+
+Modules.Upgrades = { Name = "Upgrades", Icon = "⬆️", Init = function(page)
+	page:Section("Upgrades")
+	local blocked = {}
+	Feature(page, "upgrade_all", "Auto Upgrade All Characters",
+		"Percorre a pasta de personagens e envia upgrade; o servidor decide se há recursos.", 1, function()
+			local folder = Utils.need("upgrade_all", "CharacterFolder")
+			local remote = Utils.need("upgrade_all", "UpgradeRemote")
+			if not (folder and remote) then return end
+			for _, ch in ipairs(folder:GetChildren()) do
+				if not Toggles.Active("upgrade_all") then break end
+				if not (blocked[ch] and os.clock() < blocked[ch]) then
+					local res = Utils.call(remote, Configuration.Builders.Upgrade(ch))
+					blocked[ch] = os.clock() + (res == false and 30 or Configuration.UpgradeCooldown)
+					task.wait(0.05)
+				end
+			end
+		end)
+
+	page:Section("Níveis dos personagens (Mochila aberta)")
+	local UP_ONE = { "subir de n", "level up", "upgrade", "melhorar" }
+	local function detailBtn(mode)
+		for _, e in ipairs(Utils.buttons(false)) do
+			local t = e.text
+			local isMax = t:match("^%s*max") ~= nil
+			if Utils.parsePrice(t) then
+				if mode == "max" and isMax then return e end
+				if mode == "one" and not isMax and matches(t, UP_ONE) then return e end
+			end
+		end
+		return nil
+	end
+	-- cartões dos personagens na Mochila: botões dentro de um ScrollingFrame que mostram "$xxx/s"
+	local function cards()
+		local out = {}
+		for _, e in ipairs(Utils.buttons(false)) do
+			if e.btn:FindFirstAncestorOfClass("ScrollingFrame") and parseIncome(e.text) then
+				table.insert(out, e.btn)
+			end
+		end
+		table.sort(out, function(a, b)
+			local pa, pb = a.AbsolutePosition, b.AbsolutePosition
+			if math.abs(pa.Y - pb.Y) > 4 then return pa.Y < pb.Y end
+			return pa.X < pb.X
+		end)
+		return out
+	end
+	local warnedBag = 0
+	local function levelPass(id, mode)
+		local list = cards()
+		if #list == 0 then
+			if os.clock() - warnedBag > 15 then
+				warnedBag = os.clock()
+				Notifications.Push("Upgrade", "Abra a Mochila (aba Baddies) para eu enxergar os personagens.", "warn")
+			end
+			return
+		end
+		for _, card in ipairs(list) do
+			if not Toggles.Active(id) then return end
+			if card.Parent then
+				Utils.scrollInto(card)
+				Utils.clickGui(card)
+				task.wait(Configuration.LevelSelectWait)
+				local e = detailBtn(mode)
+				if e then
+					local price, money = Utils.parsePrice(e.text), Utils.money()
+					if not (price and money and price > money) then
+						Utils.clickGui(e.btn)
+						task.wait(0.2)
+					end
+				end
+			end
+		end
+	end
+	Feature(page, "level_one", "Auto Subir 1 Nível (todos)",
+		"Com a Mochila aberta: seleciona cada personagem e aperta 'Subir de Nível' uma vez.", 2, function()
+			levelPass("level_one", "one")
+		end)
+	Feature(page, "level_max", "Auto Subir ao Máximo (todos)",
+		"Com a Mochila aberta: seleciona cada personagem e aperta 'Max' (o máximo que o dinheiro permite).", 3, function()
+			levelPass("level_max", "max")
+		end)
+	page:Button("Escanear Mochila (cartões e botões de nível)", function()
+		local out = {}
+		local c = cards()
+		table.insert(out, "Cartões encontrados: " .. #c)
+		for i = 1, math.min(5, #c) do table.insert(out, "  cartão: " .. c[i]:GetFullName()) end
+		for _, mode in ipairs({ "one", "max" }) do
+			local e = detailBtn(mode)
+			table.insert(out, mode .. ": " .. (e and (e.text:sub(1, 40) .. " | " .. e.btn:GetFullName()) or "não achei (selecione um personagem)"))
+		end
+		table.insert(out, "Dinheiro lido: " .. tostring(Utils.money()))
+		dumpText("Scan da Mochila", out)
+	end)
+end }
+
+Modules.Shop = { Name = "Loja", Icon = "🛒", Init = function(page)
+	page:Section("Loja")
+	-- 100% automático: não precisa de caminho nenhum. Procura as lojas de poções/venenos na GUI do jogo
+	-- (aberta OU fechada, se o executor tiver getconnections), ignora Robux e estrelas/gemas e compra com o dinheiro do jogo.
+	local SHOP_WORDS = { "poç", "pocao", "potion", "venen", "poison", "loja", "shop", "store" }
+	local BUY_WORDS = { "buy", "comprar", "compra", "purchase" }
+	local BAD_WORDS = { "esgotado", "sold out", "max", "bloquead", "locked", "indispon", "owned", "adquirido", "equipado" }
+	local UNITS = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qi = 1e18, sx = 1e21, sp = 1e24, o = 1e27, n = 1e30, d = 1e33 }
+	local canHidden = getconnections ~= nil
+	local function vis(g) return canHidden or Utils.shown(g) end
+
+	local function clean(t) return (t:gsub("<[^>]+>", "")) end
+
+	local function textOf(g)
+		local t = {}
+		if g:IsA("TextButton") and g.Text ~= "" then table.insert(t, g.Text) end
+		for _, d in ipairs(g:GetDescendants()) do
+			if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and vis(d) then table.insert(t, d.Text) end
+		end
+		return clean(table.concat(t, " ")):lower()
+	end
+
+	local function parsePrice(text)
+		local num, unit = text:match("%$%s*([%d%.,]+)%s*(%a*)")
+		if not num then return nil end
+		num = tonumber((num:gsub(",", "")))
+		if not num then return nil end
+		return num * (UNITS[unit:lower()] or 1)
+	end
+
+	local function starText(t)
+		return t:find("%f[%a]stars?%f[%A]") or t:find("estrela") or t:find("%f[%a]gems?%f[%A]") or t:find("gema")
+			or t:find("diamond") or t:find("diamante") or t:find("★", 1, true) or t:find("⭐", 1, true)
+	end
+
+	-- Pula pelo CAMINHO: RobuxShopPanel, Templates (modelos clonados pelo jogo), Premium, Gamepass, cartões Rx...
+	local function pathSkip(node)
+		local cur = node
+		while cur and cur ~= game do
+			local n = cur.Name
+			local l = n:lower()
+			if l == "templates" or l:find("robux") or l:find("premium") or l:find("gamepass")
+				or n:match("^Rx%u") then
+				return "caminho " .. n
+			end
+			cur = cur.Parent
+		end
+		return nil
+	end
+
+	local function skipReason(node, txt)
+		local ps = pathSkip(node)
+		if ps then return ps end
+		if txt:find("buy all", 1, true) or txt:find("comprar tudo", 1, true) then return "comprar tudo" end
+		if txt:find("r%$") or txt:find("robux") or txt:find("premium") or txt:find("gamepass") then return "Robux/premium" end
+		if starText(txt) then return "estrela/gema" end
+		for _, d in ipairs(node:GetDescendants()) do
+			local n = d.Name:lower()
+			if n:find("robux") or n:find("premium") or n:find("gamepass") then return "ícone Robux" end
+		end
+		local cur = node
+		for _ = 1, 4 do
+			if not cur then break end
+			for _, f in ipairs(Configuration.SkipFlags) do
+				if cur:GetAttribute(f) then return "atributo " .. f end
+			end
+			cur = cur.Parent
+		end
+		if matches(txt, BAD_WORDS) then return "indisponível" end
+		return nil
+	end
+
+	-- { btn, price, text, skip }. Se o preço está no próprio botão, só ele conta (um cartão pode ter botão de dinheiro E de estrela).
+	local function analyze(btn)
+		local own = textOf(btn)
+		local ownPrice = parsePrice(own)
+		local hasBuy = matches(own, BUY_WORDS)
+		if not (ownPrice or hasBuy) then return nil end
+		local scopeNode, scopeText = btn, own
+		if not ownPrice then
+			local card = btn.Parent
+			if card and card:IsA("GuiObject") and #card:GetChildren() <= 8 then
+				scopeNode, scopeText = card, own .. " " .. textOf(card)
+			end
+		end
+		return { btn = btn, price = ownPrice or parsePrice(scopeText), text = own, skip = skipReason(scopeNode, scopeText) }
+	end
+
+	-- Painel da loja = menor ancestral de um texto "poção/veneno/loja..." que tenha 2+ botões de compra.
+	local function collect()
+		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		if not pg then return {} end
+		local memo, tried, seen, out = {}, {}, {}, {}
+		local function info(btn)
+			local v = memo[btn]
+			if v == nil then v = analyze(btn) or false memo[btn] = v end
+			return v
+		end
+		for _, g in ipairs(pg:GetDescendants()) do
+			if (g:IsA("TextLabel") or g:IsA("TextButton")) and g.Text ~= "" and vis(g)
+				and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) then
+				local t = clean(g.Text):lower()
+				local hit = false
+				for _, w in ipairs(SHOP_WORDS) do
+					if t:find(w, 1, true) then hit = true break end
+				end
+				if hit then
+					local a = g.Parent
+					for _ = 1, 4 do
+						if not (a and a:IsA("GuiObject")) then break end
+						if tried[a] == nil then
+							local list = {}
+							for _, d in ipairs(a:GetDescendants()) do
+								if d:IsA("GuiButton") and vis(d) and not seen[d] then
+									local i = info(d)
+									if i then table.insert(list, i) end
+								end
+							end
+							tried[a] = #list >= 2
+							if tried[a] then
+								for _, i in ipairs(list) do
+									seen[i.btn] = true
+									table.insert(out, i)
+								end
+							end
+						end
+						if tried[a] then break end
+						a = a.Parent
+					end
+				end
+			end
+		end
+		return out
+	end
+
+	local function scrollInto(btn)
+		local sf = btn:FindFirstAncestorOfClass("ScrollingFrame")
+		if not (sf and Utils.shown(btn)) then return end
+		local top, by = sf.AbsolutePosition.Y, btn.AbsolutePosition.Y
+		if by < top or by + btn.AbsoluteSize.Y > top + sf.AbsoluteSize.Y then
+			local target = sf.CanvasPosition.Y + (by - top) - (sf.AbsoluteSize.Y - btn.AbsoluteSize.Y) / 2
+			sf.CanvasPosition = Vector2.new(sf.CanvasPosition.X, math.max(0, target))
+			task.wait(0.1)
+		end
+	end
+
+	local lastBuy = setmetatable({}, { __mode = "k" })
+	local announced = false
+	Feature(page, "shop_gui", "Auto Buy Poções/Venenos",
+		"Detecta as lojas sozinho e compra todos os itens com dinheiro do jogo. Ignora Robux e estrelas/gemas.",
+		1.5, function()
+			local list = {}
+			for _, info in ipairs(collect()) do
+				if not info.skip then table.insert(list, info) end
+			end
+			if #list == 0 then announced = false return end
+			if not announced then
+				announced = true
+				Notifications.Push("Loja detectada", #list .. " itens com dinheiro do jogo.")
+			end
+			table.sort(list, function(a, b) return (a.price or 0) < (b.price or 0) end)
+			for _, info in ipairs(list) do
+				if not Toggles.Active("shop_gui") then break end
+				local btn = info.btn
+				if btn.Parent and os.clock() - (lastBuy[btn] or 0) >= 0.8 then
+					lastBuy[btn] = os.clock()
+					scrollInto(btn)
+					Utils.clickGui(btn, not Utils.shown(btn)) -- loja fechada: só dispara o botão (sem clique na tela)
+					task.wait(0.2)
+				end
+			end
+		end)
+	-- Auras: compra toda aura que aparecer disponível (botão de compra/preço dentro do painel de Auras)
+	local AURA_BUY = { "buy", "comprar", "compra", "purchase", "unlock", "desbloquear", "obter" }
+	local AURA_BAD = { "equip", "renascimento", "rebirth", "robux", "r$", "buy all", "comprar tudo", "esgotado", "sold out" }
+	local lastAura = setmetatable({}, { __mode = "k" })
+	local function auraButtons()
+		local out = {}
+		for _, e in ipairs(Utils.buttons(true)) do
+			local t = e.text
+			local price = Utils.parsePrice(t)
+			if (price or matches(t, AURA_BUY)) and not matches(t, AURA_BAD) and not starText(t) then
+				local scope, ok = e.btn.Parent, false
+				for _ = 1, 3 do
+					if scope and scope:IsA("GuiObject") then
+						local st = Utils.textOf(scope)
+						if st:find("aura", 1, true) and not st:find("poç", 1, true) and not st:find("venen", 1, true) then ok = true break end
+						scope = scope.Parent
+					end
+				end
+				if ok then
+					e.price = price
+					table.insert(out, e)
+				end
+			end
+		end
+		return out
+	end
+	Feature(page, "shop_aura", "Auto Buy Auras",
+		"Compra toda aura que ficar disponível (ignora Robux, estrelas e as bloqueadas por Renascimento).", 2, function()
+			local money = Utils.money()
+			for _, e in ipairs(auraButtons()) do
+				if not Toggles.Active("shop_aura") then break end
+				local btn = e.btn
+				if btn.Parent and os.clock() - (lastAura[btn] or 0) >= 2 and not (e.price and money and e.price > money) then
+					lastAura[btn] = os.clock()
+					Utils.scrollInto(btn)
+					Utils.clickGui(btn, not Utils.shown(btn))
+					task.wait(0.2)
+				end
+			end
+		end)
+	page:Button("Escanear auras (o que ele compraria)", function()
+		local out = { "Dinheiro lido: " .. tostring(Utils.money()) }
+		for _, e in ipairs(auraButtons()) do
+			table.insert(out, ("%s | preço=%s | '%s' | %s"):format(e.shown and "VISÍVEL" or "FECHADO", tostring(e.price), e.text:sub(1, 40), e.btn:GetFullName()))
+		end
+		dumpText("Scan de auras", out)
+	end)
+	page:Button("Escanear loja (mostra o que ele detectou)", function()
+		local out = {}
+		for _, info in ipairs(collect()) do
+			table.insert(out, ("%s | preço=%s | texto='%s' | %s"):format(
+				info.skip and ("PULADO(" .. info.skip .. ")") or "COMPRA",
+				tostring(info.price), info.text:sub(1, 40), info.btn:GetFullName()))
+		end
+		if #out == 0 then out[1] = "Nenhum botão de compra encontrado. Abra a loja de poções/venenos e tente de novo." end
+		local text = table.concat(out, "\n")
+		print(text)
+		if setclipboard then pcall(setclipboard, text) end
+		Notifications.Push("Scan da loja", #out .. " linhas" .. (setclipboard and " copiadas." or " no console."))
+	end)
+	page:Info(canHidden and "Funciona com a loja aberta ou fechada." or "Seu executor não tem getconnections: deixe a loja aberta na tela.")
+end }
+
+Modules.Movement = { Name = "Movimento", Icon = "🧭", Init = function(page)
+	local beat = nil
+	local sync
+
+	page:Section("Ir até o personagem")
+	page:Toggle("moveto", "Ir até o personagem",
+		"Já vem ligado: voa até o Baddie escolhido automaticamente. Modo (voando/andando) e velocidade ficam em Config. Autofarm > Movimento.", true)
+
+	local function step(dt)
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then return end
+		local t = Utils.currentTarget()
+		if not t then return end
+		local goal, stop = t.part.Position, math.max(3, t.prompt.MaxActivationDistance * 0.7)
+		local to = goal - hrp.Position
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		if to.Magnitude <= stop then return end
+		local len = math.min(to.Magnitude - stop, Configuration.FlySpeed * dt)
+		hrp.CFrame = CFrame.new(hrp.Position + to.Unit * len) * (hrp.CFrame - hrp.CFrame.Position)
+	end
+
+	function sync()
+		local want = Toggles.Active("moveto") and Configuration.MoveMode == "fly" and not Hub.Destroyed
+		if want and not beat then
+			beat = RunService.Heartbeat:Connect(function(dt)
+				local ok, err = pcall(step, dt)
+				if not ok then
+					Utils.softError("Voo", err)
+				end
+			end)
+		elseif not want and beat then
+			beat:Disconnect()
+			beat = nil
+		end
+	end
+	Hub.SyncMove = sync
+	Toggles.Listen(sync)
+	table.insert(Hub.Cleanup, { Destroy = function() if beat then beat:Disconnect() beat = nil end end })
+	sync()
+end }
+
+--==================================================================
+-- Config. Autofarm: todos os ajustes de tempo, uma sub-aba por função
+--==================================================================
+local function newSub(host)
+	local self = setmetatable({ Ids = {}, n = 0 }, Page)
+	self.Frame = create("ScrollingFrame", {
+		Position = UDim2.fromOffset(0, 38), Size = UDim2.new(1, 0, 1, -38), BackgroundTransparency = 1,
+		ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Accent, BorderSizePixel = 0, Visible = false,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), Parent = host,
+	}, {
+		create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+		create("UIPadding", { PaddingRight = UDim.new(0, 6) }),
+	})
+	return self
+end
+
+local function buildAutofarm(page)
+	local host = page.Frame
+	local bar = create("ScrollingFrame", {
+		Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1, ScrollBarThickness = 0, BorderSizePixel = 0,
+		AutomaticCanvasSize = Enum.AutomaticSize.X, CanvasSize = UDim2.new(),
+		ScrollingDirection = Enum.ScrollingDirection.X, Parent = host,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+	local subs = {}
+	local function pick(sub)
+		for _, s in ipairs(subs) do
+			s.Frame.Visible = (s == sub)
+			tween(s.TabBtn, 0.15, { BackgroundColor3 = (s == sub) and Theme.Accent or Theme.Card })
+		end
+	end
+	local function tab(name)
+		local sub = newSub(host)
+		sub.TabBtn = create("TextButton", {
+			Text = name, Font = Theme.FontBold, TextSize = 12, TextColor3 = Theme.Text, AutoButtonColor = false,
+			AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 28), BackgroundColor3 = Theme.Card,
+			LayoutOrder = #subs + 1, Parent = bar,
+		}, { round(8), create("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }) })
+		connect(sub.TabBtn.MouseButton1Click, function() pick(sub) end)
+		table.insert(subs, sub)
+		if #subs == 1 then pick(sub) end
+		return sub
+	end
+	local function iv(sub, id, label, hint)
+		Configuration.Intervals[id] = Configuration.Intervals[id] or 1
+		sub:Slider("Intervalo: " .. label .. " (s)", 0.05, 5, Configuration.Intervals[id], 2, function(v)
+			Configuration.Intervals[id] = v
+		end, hint)
+	end
+	local function tune(sub, label, key, min, max, dec, hint)
+		sub:Slider(label, min, max, Configuration[key], dec, function(v) Configuration[key] = v end, hint)
+	end
+
+	-- GERAL
+	local s = tab("Geral")
+	s:Info("Valem para todas as funções de autofarm. Os ajustes ficam salvos quando você aperta 'Salvar configuração' (aba Configurações).")
+	s:Slider("Velocidade global (x)", 0.25, 5, Configuration.Speed, 2, function(v) Configuration.Speed = v end,
+		"Multiplica a velocidade de TODAS as funções. 2 = tudo roda duas vezes mais rápido (os intervalos caem pela metade).")
+	tune(s, "Raio da área (studs)", "AreaRadius", 50, 1000, 0,
+		"Distância máxima do centro da área. Auto Talk e Coleta nunca saem dela. Raid e Fendas ignoram esse limite.")
+	local function refreshCenter()
+		if Configuration.AreaPinned then return end
+		local any = Toggles.Get("talk") or Toggles.Get("talk_buddy") or Toggles.Get("mission_collect")
+		if any and not Configuration.AreaCenter then
+			local char = LocalPlayer.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			if hrp then Configuration.AreaCenter = hrp.Position end
+		elseif not any then
+			Configuration.AreaCenter = nil
+		end
+	end
+	Toggles.Listen(refreshCenter)
+	s:Button("Fixar centro da área aqui", function()
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then error("Personagem não encontrado") end
+		Configuration.AreaCenter, Configuration.AreaPinned = hrp.Position, true
+		Notifications.Push("Área", "Centro fixado aqui (raio " .. Configuration.AreaRadius .. ").")
+	end)
+	s:Button("Centro automático (onde estiver ao ligar)", function()
+		Configuration.AreaPinned, Configuration.AreaCenter = false, nil
+		refreshCenter()
+		Notifications.Push("Área", "Centro automático.")
+	end)
+	tune(s, "Tempo máx. em um alvo (s)", "LockTimeout", 10, 120, 0,
+		"Se não conseguir terminar com um alvo nesse tempo, ele desiste e passa para o próximo.")
+
+	-- MOVIMENTO
+	s = tab("Movimento")
+	s:Info("Ao ir até o personagem, o voo já vem ativo automaticamente (liga/desliga em Movimento). Aqui você escolhe o modo e a velocidade.")
+	s:Choice("Como ir até o personagem?", {
+		{ id = "fly", text = "Voando" },
+		{ id = "walk", text = "Andando" },
+	}, function() return Configuration.MoveMode end, function(v)
+		Configuration.MoveMode = v
+		Configuration.Save()
+		if Hub.SyncMove then Hub.SyncMove() end
+	end)
+	tune(s, "Velocidade do voo (studs/s)", "FlySpeed", 20, 200, 0,
+		"Só vale no modo Voando. Quanto maior, mais rápido ele chega ao personagem. Valores muito altos podem chamar atenção do jogo.")
+
+	-- CONVERSA E BEG
+	s = tab("Conversa e Beg")
+	s:Info("Auto Talk vai ao Baddie, abre a conversa e aperta BEG!. Depois o Beg acerta o minigame apertando a tecla E.")
+	iv(s, "talk", "Auto Talk", "Com que frequência o Auto Talk procura alvo e age. Menor = mais rápido, mas pesa mais.")
+	iv(s, "talk_buddy", "Auto Talk Buddies", "Igual ao anterior, mas para os Buddies.")
+	tune(s, "Repetir a conversa a cada (s)", "RetryEvery", 1, 10, 1,
+		"Tempo entre uma tentativa e outra de abrir a conversa com o mesmo personagem, se a primeira falhar.")
+	tune(s, "Clicar no BEG! a cada (s)", "BegClickEvery", 0.5, 5, 1,
+		"Com a conversa aberta, de quanto em quanto tempo ele aperta o botão BEG!.")
+	s:Slider("Fechar a conversa quando o personagem sumir (0 = não, 1 = sim)", 0, 1, Configuration.AutoCloseDialog and 1 or 0, 0, function(v)
+		Configuration.AutoCloseDialog = v >= 1
+	end, "Ele só aperta o X quando o personagem some (coletado ou foi embora). Nunca aperta antes disso.")
+	tune(s, "Esperar depois que ele sumir (s)", "CloseDelay", 0, 3, 1,
+		"Pausa entre o personagem sumir e o clique no X. Aumente se o X estiver sendo apertado cedo demais.")
+	s:Section("Minigame do Beg (acerto perfeito)")
+	tune(s, "Ponto de acerto (0 = borda, 1 = centro)", "PerfectPoint", 0, 1, 2,
+		"Onde dentro da zona vermelha ele aperta E. 0 aperta assim que o risco encosta; 1 só no meio exato.")
+	tune(s, "Antecipação (s)", "PerfectLead", 0, 0.2, 3,
+		"Aperta um pouco antes para compensar o atraso do toque. Se estiver errando por tarde, aumente.")
+	tune(s, "Folga (px)", "PerfectTolerance", 0, 20, 0,
+		"Margem extra, em pixels, em volta da zona vermelha.")
+	tune(s, "Repetições do E por rodada", "PerfectPresses", 1, 5, 0,
+		"Se o primeiro E não registrar, ele repete até esse número.")
+	tune(s, "Intervalo entre repetições (s)", "PerfectCooldown", 0.05, 1, 2,
+		"Tempo mínimo entre dois E seguidos na mesma rodada.")
+	s:Slider("E direto nos scripts do jogo (0 = não, 1 = sim)", 0, 1, Configuration.DirectInput and 1 or 0, 0, function(v)
+		Configuration.DirectInput = v >= 1
+	end, "Reforço: além do teclado virtual, chama direto os scripts do jogo que escutam a tecla E. Ajuda no celular.")
+	s:Input("Tecla", Configuration.PerfectKey, "E, Click ou E+Click", function(t)
+		if t ~= "" then Configuration.PerfectKey = t end
+	end)
+	s:Button("Escanear GUI vermelha (com o minigame aberto)", Configuration.ScanRed)
+
+	-- RAID
+	s = tab("Raid")
+	s:Info("Passos da raid: viajar para o centro (menu Viagem), interagir no pad, escolher a dificuldade, selecionar os melhores e iniciar. Aqui você ajusta os tempos de cada passo. A dificuldade fica na aba Raids.")
+	iv(s, "raid", "Auto Raid", "Com que frequência ele confere se a invasão abriu ou se há um passo para fazer.")
+	tune(s, "Esperar após escolher a dificuldade (s)", "RaidWaitDiff", 0.1, 3, 1,
+		"Pausa depois de clicar na dificuldade, para o jogo atualizar a tela. Aumente se ele estiver pulando passos.")
+	tune(s, "Esperar após selecionar os melhores (s)", "RaidWaitBest", 0.1, 3, 1,
+		"Pausa depois de apertar o botão de melhores personagens, antes de iniciar.")
+	tune(s, "Repetir 'Iniciar' a cada (s)", "RaidStartEvery", 0.5, 10, 1,
+		"Se a raid não começar, de quanto em quanto tempo ele aperta Iniciar de novo.")
+	tune(s, "Tentar viajar para a raid a cada (s)", "RaidEntryEvery", 2, 30, 0,
+		"Tempo mínimo entre duas tentativas de viajar (botão RAIDS 'OPEN' do menu Viagem ou aviso 'Vá para a invasão').")
+	tune(s, "Distância do prompt do centro (studs)", "RaidPadRadius", 5, 60, 0,
+		"Depois de viajar, ele interage com o prompt mais próximo dentro dessa distância. Aumente se não achar o pad.")
+
+	-- FENDAS
+	s = tab("Fendas")
+	s:Info("Quando uma fenda abre, o Auto Fendas viaja até ela pelo menu Viagem e interage com o prompt da fenda perto de você.")
+	iv(s, "rift", "Auto Fendas", "Com que frequência ele confere o menu Viagem atrás de uma fenda aberta.")
+	tune(s, "Não voltar à mesma fenda por (s)", "RiftCooldown", 10, 300, 0,
+		"Depois de viajar para uma fenda, ele não clica nela de novo por esse tempo (evita ficar se teletransportando).")
+	tune(s, "Interagir só a até X studs de você", "RiftRadius", 30, 500, 0,
+		"Só usa prompts de fenda que estejam a essa distância de você. Evita ir até a base dos outros jogadores.")
+
+	-- RESGATES
+	s = tab("Resgates")
+	s:Info("Clica em todos os 'Resgatar' das Tarefas, Solicitações, Recompensas e Conquistas (inclusive 'Resgatar Todos'). Nunca clica no campo de código.")
+	iv(s, "claim_all", "Auto Resgatar", "De quanto em quanto tempo ele varre a tela atrás de recompensas para resgatar.")
+	s:Slider("Resgatar com o painel fechado (0 = não, 1 = sim)", 0, 1, Configuration.ClaimHidden and 1 or 0, 0, function(v)
+		Configuration.ClaimHidden = v >= 1
+	end, "Com 1, ele resgata sem você abrir os painéis (precisa do getconnections no executor). Com 0, só o que estiver aberto na tela.")
+
+	-- UPGRADES
+	s = tab("Upgrades")
+	s:Info("Com a Mochila aberta, ele seleciona cada personagem e aperta o botão de nível. Os upgrades por Remote usam os caminhos da aba Configurações.")
+	iv(s, "level_one", "Subir 1 nível", "Tempo entre uma rodada completa e a próxima (cada rodada passa por todos os personagens).")
+	iv(s, "level_max", "Subir ao máximo", "Igual ao anterior, para o botão 'Max'.")
+	iv(s, "upgrade_all", "Upgrade por Remote", "Só vale se você configurou os caminhos CharacterFolder e UpgradeRemote.")
+	tune(s, "Esperar ao selecionar o personagem (s)", "LevelSelectWait", 0.1, 2, 2,
+		"Tempo para o jogo mostrar o personagem escolhido antes de apertar o botão de nível. Aumente se ele pular personagens.")
+
+	-- LOJA
+	s = tab("Loja")
+	s:Info("Compra poções/venenos e auras com o dinheiro do jogo. Ignora Robux, estrelas e gemas.")
+	iv(s, "shop_gui", "Poções/Venenos", "De quanto em quanto tempo ele tenta comprar tudo que está disponível.")
+	iv(s, "shop_aura", "Auras", "De quanto em quanto tempo ele procura uma aura nova para comprar.")
+
+	-- MISSÕES E SPINS
+	s = tab("Missões e Spins")
+	s:Info("Intervalo das funções de missões e spins. As de Remote só funcionam com o caminho configurado na aba Configurações.")
+	iv(s, "mission_collect", "Coletar missões", "Com que frequência ele procura prompts de missão/coleta.")
+	iv(s, "mission_complete", "Completar missões", "Com que frequência ele envia a conclusão ao Remote.")
+	iv(s, "spin_class", "Spin de classe", "Tempo entre um spin e o próximo.")
+	iv(s, "spin_passive", "Spin de passiva", "Tempo entre um spin e o próximo.")
+end
+
+--==================================================================
+-- Settings (página)
+--==================================================================
+local function buildSettings(page)
+	page:Section("Geral")
+	page:Toggle("master", "Todas as funções", "Liga/desliga tudo sem perder o estado de cada toggle.", true)
+	page:Toggle("notifications", "Notificações", nil, true)
+	page:Toggle("rarest", "Priorizar o mais raro", "Vai primeiro ao de maior raridade e depois desce para os mais baixos. Só dentro da área.", true)
+	page:Input("Campo de raridade", Configuration.RarityKey, "Attribute/Value do jogo", function(t)
+		if t ~= "" then Configuration.RarityKey = t end
+	end)
+	page:Info("Intervalos, tempos e área ficam na aba 'Config. Autofarm'.")
+	page:Section("Botão do Hub")
+	page:Info("O botão quadrado liga/desliga o Hub (arraste para mover). Para usar uma imagem de anime: salve um .png na pasta workspace do executor com o nome BegABaddiesHubIcon.png, ou cole abaixo o ID de uma imagem do Roblox.")
+	page:Input("ID da imagem", Configuration.IconId, "só números", function(t)
+		local id = (t or ""):gsub("%D", "")
+		Configuration.IconId = id
+		Hub.ApplyIcon()
+		Configuration.Save()
+	end)
+	page:Section("Ferramentas")
+	page:Button("Escanear jogo (Remotes, Prompts, GUIs)", Configuration.Scan)
+	page:Button("Prompts por perto (fique ao lado de um Baddie)", Configuration.ScanNearby)
+	page:Button("Diagnóstico (conversa / Beg)", function()
+		local n = 0
+		for _ in pairs(Prompts) do n += 1 end
+		local t = Lock.target
+		local marked = {}
+		for k in pairs(Configuration.RarityFilter) do table.insert(marked, k) end
+		local lines = {
+			"Auto Talk: " .. tostring(Toggles.Get("talk")) .. " | master: " .. tostring(Toggles.Get("master")),
+			"Beg (E): " .. tostring(Toggles.Get("perfect")) .. " | tecla: " .. Configuration.PerfectKey,
+			"Prompts rastreados: " .. n,
+			"Alvo: " .. (t and t.prompt:GetFullName() or "nenhum"),
+			"BEG! visível: " .. tostring(Utils.findBeg() ~= nil),
+			"Minigame ativo: " .. tostring(Mini.active) .. " | já visto: " .. tostring(Mini.seen),
+			"fireproximityprompt: " .. tostring(fireproximityprompt ~= nil),
+			"Último input: " .. tostring(UIS:GetLastInputType()),
+			"Raridades marcadas: " .. (#marked > 0 and table.concat(marked, ", ") or "nenhuma (todas)")
+				.. " | só marcadas: " .. tostring(Configuration.StrictRarity),
+			"Bloqueados: " .. (#Configuration.Blacklist > 0 and table.concat(Configuration.Blacklist, ", ") or "nenhum"),
+			"Raio da área: " .. Configuration.AreaRadius,
+		}
+		local text = table.concat(lines, "\n")
+		print(text)
+		if setclipboard then pcall(setclipboard, text) end
+		Notifications.Push("Diagnóstico", "Copiado" .. (setclipboard and " para a área de transferência." or " no console."))
+	end)
+	page:Button("Salvar configuração", function()
+		Notifications.Push("Configuração", Configuration.Save() and "Salva." or "Executor sem writefile.", "info")
+	end)
+	page:Button("Desligar todas as funções", function()
+		for id, v in pairs(Toggles.State) do
+			if v and id ~= "master" and id ~= "notifications" and id ~= "moveto" and id ~= "rarest" then Toggles.Set(id, false) end
+		end
+	end)
+	page:Section("Caminhos (ex.: ReplicatedStorage.Pasta.Remote)")
+	local order = {
+		"MissionFolder", "MissionComplete", "PerfectMarker", "PerfectLine", "PerfectRemote", "ClassSpin", "PassiveSpin",
+		"CharacterFolder", "UpgradeRemote",
+	}
+	for _, key in ipairs(order) do
+		page:Input(key, Configuration.Paths[key], "vazio = não configurado", function(t)
+			Configuration.Paths[key] = (t or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		end)
+	end
+end
+
+--==================================================================
+-- Boot
+--==================================================================
+local pageFor = {}
+for _, key in ipairs({ "Missions", "Conversations", "Raids", "Rarities", "Movement", "Combat", "Spins", "Upgrades", "Shop" }) do
+	local m = Modules[key]
+	local ok, err = pcall(function()
+		-- o Beg (Combat) fica na mesma aba do Movimento
+		local page = (key == "Combat" and pageFor.Movement) or newPage(m.Name, m.Icon)
+		pageFor[key] = page
+		m.Init(page)
+	end)
+	if not ok then warn("[BegABaddiesHub] módulo " .. key .. " falhou: " .. tostring(err)) end
+end
+local okCfg, errCfg = pcall(function() buildAutofarm(newPage("Config. Autofarm", "🛠️", true)) end)
+if not okCfg then warn("[BegABaddiesHub] Config. Autofarm falhou: " .. tostring(errCfg)) end
+buildSettings(newPage("Configurações", "⚙️"))
+for _, fn in ipairs(Toggles.Listeners) do pcall(fn) end
+Notifications.Push("Beg a Baddies Hub", "Carregado. RightShift mostra/oculta a janela.")
