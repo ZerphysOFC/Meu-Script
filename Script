@@ -1,12 +1,21 @@
 --[[
-    Beg a Baddies Hub (Luau) - v17  |  Zerphys
-    NOVO nesta versão (otimização, sem mudar o comportamento):
-      * Auto Talk muito mais leve: o texto dos prompts fica em cache, a área/distância é checada antes das
-        verificações pesadas, e a busca de alvo não roda mais a cada tick.
-      * Interface rastreada por eventos (em vez de varrer o PlayerGui inteiro várias vezes por segundo):
-        botão BEG!, detector do minigame e leitura do dinheiro.
-      * Detector do minigame: varredura pesada só quando precisa e lista de elementos em cache curto.
-    Inclui tudo da v16 (locais Market/Forest/Castle, Local do farm, raridades recolhíveis) e do Auto Raid.
+    Beg a Baddies Hub (Luau) - v19  |  Zerphys
+    NOVO nesta versão:
+      * Tela de carregamento com o NOVO vídeo (quadros + som), mesmo método da v18.
+      * Barra de carregamento sincronizada com o vídeo. Quando o vídeo termina aparece "ZRP".
+        Botão "Ignorar" no canto direito pula o vídeo e conclui o carregamento.
+      * Cores: roxo mais suave e semi-transparente (dá para ver o fundo do jogo através da janela).
+      * Fonte Minecraft aplicada em toda a interface.
+
+    ARQUIVOS (coloque na pasta "workspace" do seu executor, com estes nomes exatos):
+      - Minecraft.ttf
+      - ZRP2_sheet1.jpg, ZRP2_sheet2.jpg, ZRP2_sheet3.jpg, ZRP2_sheet4.jpg  (os quadros do vídeo)
+      - ZRP2_audio.mp3                                                      (o som do vídeo)
+    Os arquivos antigos (ZRP_sheet1 a 6 e ZRP_audio.mp3) não são mais usados: pode apagar.
+    Se algum arquivo faltar ou o executor não suportar, o script continua normal
+    (fonte padrão / barra de carregamento por tempo, sem vídeo).
+
+    Inclui tudo da v17 (Auto Talk leve, interface por eventos, locais Market/Forest/Castle, Auto Raid).
 ]]
 
 local Players = game:GetService("Players")
@@ -33,15 +42,16 @@ end
 -- Tema e helpers de interface
 --==================================================================
 local Theme = {
-	Bg = Color3.fromRGB(11, 8, 18),
-	Panel = Color3.fromRGB(20, 13, 36),
-	Side = Color3.fromRGB(15, 11, 24),
-	Card = Color3.fromRGB(28, 21, 46),
-	Accent = Color3.fromRGB(139, 92, 246),
-	Accent2 = Color3.fromRGB(196, 167, 255),
-	Text = Color3.fromRGB(240, 232, 255),
-	Sub = Color3.fromRGB(176, 160, 206),
-	Off = Color3.fromRGB(72, 56, 104),
+	Bg = Color3.fromRGB(16, 13, 24),
+	Panel = Color3.fromRGB(26, 20, 40),
+	Side = Color3.fromRGB(20, 16, 30),
+	Card = Color3.fromRGB(34, 28, 50),
+	Accent = Color3.fromRGB(132, 104, 196),
+	Accent2 = Color3.fromRGB(190, 172, 232),
+	AccentDark = Color3.fromRGB(96, 74, 160),
+	Text = Color3.fromRGB(240, 234, 252),
+	Sub = Color3.fromRGB(176, 164, 202),
+	Off = Color3.fromRGB(66, 58, 90),
 	Good = Color3.fromRGB(74, 222, 128),
 	Warn = Color3.fromRGB(255, 200, 120),
 	Error = Color3.fromRGB(255, 120, 160),
@@ -49,11 +59,31 @@ local Theme = {
 	FontBold = Enum.Font.GothamBold,
 }
 
+-- Fonte Minecraft (arquivo Minecraft.ttf na pasta workspace). Se não der, usa a fonte padrão.
+local FONT_FILE = "Minecraft.ttf"
+local FONT_JSON = "BegABaddiesHubFont.json"
+do
+	pcall(function()
+		if not (isfile and writefile and getcustomasset) then return end
+		if not isfile(FONT_FILE) then return end
+		local json = HttpService:JSONEncode({
+			name = "Minecraft",
+			faces = { { name = "Regular", weight = 400, style = "normal", assetId = getcustomasset(FONT_FILE) } },
+		})
+		writefile(FONT_JSON, json)
+		Hub.FontFace = Font.new(getcustomasset(FONT_JSON), Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+	end)
+end
+local TEXT_CLASSES = { TextLabel = true, TextButton = true, TextBox = true }
+
 local function create(class, props, children)
 	local o = Instance.new(class)
 	local parent
 	for k, v in pairs(props or {}) do
 		if k == "Parent" then parent = v else o[k] = v end
+	end
+	if Hub.FontFace and TEXT_CLASSES[class] then
+		pcall(function() o.FontFace = Hub.FontFace end)
 	end
 	for _, c in ipairs(children or {}) do c.Parent = o end
 	if parent then o.Parent = parent end
@@ -944,6 +974,181 @@ local function safeParent()
 	return LocalPlayer:WaitForChild("PlayerGui")
 end
 
+--==================================================================
+-- Tela de carregamento (vídeo com som + barra sincronizada + "ZRP" + botão Ignorar)
+--==================================================================
+-- O vídeo é tocado como "quadros" (folhas de imagens) + áudio, pois muitos executors não tocam vídeo local.
+local SHEET_PREFIX = "ZRP2_sheet" -- ZRP2_sheet1.jpg ... ZRP2_sheet4.jpg
+local SHEET_COUNT = 4
+local AUDIO_FILE = "ZRP2_audio.mp3"
+local FRAME_W, FRAME_H, COLS, ROWS = 168, 168, 6, 6
+local FPS, FRAMES = 12, 144
+local DURATION = FRAMES / FPS -- 12 s
+
+-- Fechamento mínimo enquanto carrega (a versão completa é definida mais abaixo)
+function Hub.Destroy()
+	Hub.Destroyed = true
+	for _, c in ipairs(Hub.Cleanup) do
+		pcall(function()
+			if typeof(c) == "RBXScriptConnection" then c:Disconnect() else c:Destroy() end
+		end)
+	end
+	if env.BegABaddiesHub == Hub then env.BegABaddiesHub = nil end
+end
+
+local function runLoadingScreen()
+	local sg = create("ScreenGui", {
+		Name = "BegABaddiesHubLoading", ResetOnSpawn = false, DisplayOrder = 1000, IgnoreGuiInset = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = safeParent(),
+	})
+	table.insert(Hub.Cleanup, sg)
+
+	-- fundo semi-transparente: dá para ver o jogo atrás
+	local backdrop = create("Frame", {
+		Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(8, 6, 14),
+		BackgroundTransparency = 0.55, BorderSizePixel = 0, Parent = sg,
+	})
+	local card = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(404, 326),
+		BackgroundColor3 = Theme.Panel, BackgroundTransparency = 0.25, Parent = backdrop,
+	}, { round(16), stroke(Theme.Accent, 1.5, 0.35) })
+
+	-- o vídeo é quadrado (1:1)
+	local vidHolder = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 10), Size = UDim2.fromOffset(238, 238),
+		BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.3, ClipsDescendants = true, Parent = card,
+	}, { round(12) })
+	local frame = create("ImageLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = "", ScaleType = Enum.ScaleType.Stretch,
+		ImageRectSize = Vector2.new(FRAME_W, FRAME_H), Parent = vidHolder,
+	})
+	local zrp = create("TextLabel", {
+		Text = "ZRP", Font = Theme.FontBold, TextSize = 72, TextColor3 = Theme.Accent2, BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1), Visible = false, Parent = vidHolder,
+	})
+
+	local bar = create("Frame", {
+		Position = UDim2.fromOffset(14, 264), Size = UDim2.new(1, -28, 0, 12), BackgroundColor3 = Theme.Off,
+		BackgroundTransparency = 0.3, BorderSizePixel = 0, Parent = card,
+	}, { round(6) })
+	local fill = create("Frame", {
+		Size = UDim2.fromScale(0, 1), BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.15,
+		BorderSizePixel = 0, Parent = bar,
+	}, { round(6) })
+	local pct = create("TextLabel", {
+		Text = "Carregando... 0%", Font = Theme.Font, TextSize = 14, TextColor3 = Theme.Sub, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(14, 284), Size = UDim2.new(1, -28, 0, 30), Parent = card,
+	})
+
+	local skipBtn = create("TextButton", {
+		Text = "Ignorar »", Font = Theme.FontBold, TextSize = 14, TextColor3 = Theme.Text, AutoButtonColor = false,
+		BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.25, AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -20, 0, 40), Size = UDim2.fromOffset(110, 34), Parent = backdrop,
+	}, { round(10), stroke(Theme.Accent2, 1, 0.5) })
+
+	local skipped = false
+	skipBtn.MouseButton1Click:Connect(function() skipped = true end)
+
+	local function setProgress(p)
+		p = math.clamp(p, 0, 1)
+		fill.Size = UDim2.fromScale(p, 1)
+		pct.Text = "Carregando... " .. math.floor(p * 100 + 0.5) .. "%"
+	end
+
+	-- carrega as folhas de quadros e o áudio
+	local sheets, haveFrames = {}, false
+	pcall(function()
+		if not (isfile and getcustomasset) then return end
+		for i = 1, SHEET_COUNT do
+			local f = SHEET_PREFIX .. i .. ".jpg"
+			if not isfile(f) then return end
+			sheets[i] = getcustomasset(f)
+		end
+		haveFrames = true
+	end)
+	local sound
+	pcall(function()
+		if isfile and getcustomasset and isfile(AUDIO_FILE) then
+			sound = Instance.new("Sound")
+			sound.SoundId = getcustomasset(AUDIO_FILE)
+			sound.Volume = 1
+			sound.Looped = false
+			sound.Parent = sg
+		end
+	end)
+
+	-- pré-carrega as imagens/áudio para não travar no meio
+	if haveFrames then
+		pct.Text = "Carregando vídeo..."
+		local list = {}
+		for i = 1, SHEET_COUNT do
+			list[#list + 1] = create("ImageLabel", {
+				Size = UDim2.fromOffset(2, 2), Image = sheets[i], BackgroundTransparency = 1, ImageTransparency = 0.99,
+				Parent = card,
+			})
+		end
+		if sound then list[#list + 1] = sound end
+		-- PreloadAsync pode travar com arquivos locais: roda em segundo plano e nunca espera por ele
+		task.spawn(function()
+			pcall(function() game:GetService("ContentProvider"):PreloadAsync(list) end)
+		end)
+		task.wait(1.2)
+	else
+		frame.Visible = false
+		zrp.Visible = true
+		zrp.TextSize = 24
+		zrp.Text = "ZRP\n(arquivos do vídeo não encontrados)"
+	end
+
+	-- toca: o carregamento só termina quando o vídeo acabar inteiro (ou ao apertar Ignorar)
+	local PER = COLS * ROWS
+	local t0, progress, curSheet = os.clock(), 0, 0
+	if sound then pcall(function() sound:Play() end) end
+	while not Hub.Destroyed and not skipped do
+		task.wait()
+		local el = os.clock() - t0
+		progress = el / DURATION
+		if haveFrames then
+			local idx = math.min(FRAMES - 1, math.floor(el * FPS))
+			local sh = math.floor(idx / PER) + 1
+			local k = idx % PER
+			if sh ~= curSheet then
+				curSheet = sh
+				frame.Image = sheets[sh]
+			end
+			frame.ImageRectOffset = Vector2.new((k % COLS) * FRAME_W, math.floor(k / COLS) * FRAME_H)
+		end
+		if el >= DURATION then break end
+		setProgress(progress)
+	end
+
+	if Hub.Destroyed then return end
+
+	-- terminou (ou o jogador apertou Ignorar): para o áudio e conclui a barra
+	if sound then pcall(function() sound:Stop() end) end
+	if skipped then
+		local from = math.clamp(progress, 0, 1)
+		local t1 = os.clock()
+		while os.clock() - t1 < 0.4 and not Hub.Destroyed do
+			task.wait()
+			setProgress(from + (1 - from) * ((os.clock() - t1) / 0.4))
+		end
+	end
+	setProgress(1)
+	pct.Text = "Carregado!"
+	frame.Visible = false
+	zrp.TextSize = 72
+	zrp.Text = "ZRP"
+	zrp.Visible = true
+	skipBtn.Visible = false
+	task.wait(skipped and 0.5 or 1.3)
+
+	pcall(function() sg:Destroy() end)
+end
+
+pcall(runLoadingScreen)
+if Hub.Destroyed then return end
+
 local Gui = create("ScreenGui", {
 	Name = "BegABaddiesHub", ResetOnSpawn = false, DisplayOrder = 999, IgnoreGuiInset = true,
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = safeParent(),
@@ -954,10 +1159,10 @@ table.insert(Hub.Cleanup, Gui)
 local Scale = create("UIScale", { Scale = 0.85 })
 local Win = create("Frame", {
 	Name = "Window", Size = UDim2.fromOffset(660, 420), Position = UDim2.new(0.5, -330, 0.5, -210),
-	BackgroundColor3 = Theme.Bg, BackgroundTransparency = 0, ClipsDescendants = true, Parent = Gui,
+	BackgroundColor3 = Theme.Bg, BackgroundTransparency = 0.18, ClipsDescendants = true, Parent = Gui,
 }, {
-	round(16), stroke(Theme.Accent, 1.5, 0.3), Scale,
-	create("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(36, 21, 64), Theme.Bg), Rotation = 125 }),
+	round(16), stroke(Theme.Accent, 1.5, 0.4), Scale,
+	create("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(52, 40, 80), Theme.Bg), Rotation = 125 }),
 })
 tween(Scale, 0.3, { Scale = 1 })
 
@@ -988,10 +1193,11 @@ Hub.ApplyWall()
 -- Cabeçalho: marca ZERPHYS + chips de versão e status
 local Header = create("Frame", { Size = UDim2.new(1, 0, 0, 56), BackgroundTransparency = 1, Active = true, Parent = Win })
 create("Frame", {
-	Position = UDim2.fromOffset(14, 13), Size = UDim2.fromOffset(30, 30), BackgroundColor3 = Theme.Accent, Parent = Header,
+	Position = UDim2.fromOffset(14, 13), Size = UDim2.fromOffset(30, 30), BackgroundColor3 = Theme.Accent,
+	BackgroundTransparency = 0.1, Parent = Header,
 }, {
 	round(9),
-	create("UIGradient", { Color = ColorSequence.new(Theme.Accent2, Color3.fromRGB(109, 60, 220)), Rotation = 45 }),
+	create("UIGradient", { Color = ColorSequence.new(Theme.Accent2, Theme.AccentDark), Rotation = 45 }),
 	create("TextLabel", {
 		Text = "Z", Font = Theme.FontBold, TextSize = 18, TextColor3 = Color3.new(1, 1, 1),
 		BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
@@ -1014,7 +1220,7 @@ local function chip(text, x, w, color)
 		Position = UDim2.new(0, x, 0.5, 0), Size = UDim2.fromOffset(w, 24), Parent = Header,
 	}, { round(12), stroke(Theme.Accent, 1, 0.75) })
 end
-chip("v17", 206, 40, Theme.Accent2)
+chip("v19", 206, 40, Theme.Accent2)
 local StatusChip = chip("", 252, 138)
 local StatusDot = create("Frame", {
 	AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.fromOffset(7, 7),
@@ -1043,7 +1249,7 @@ local BtnPin = headerButton("📌", -90)
 local Body = create("Frame", { Position = UDim2.fromOffset(0, 56), Size = UDim2.new(1, 0, 1, -56), BackgroundTransparency = 1, Parent = Win })
 local SideFrame = create("Frame", {
 	Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0, 56, 1, -12), BackgroundColor3 = Theme.Side,
-	BackgroundTransparency = 0.25, Parent = Body,
+	BackgroundTransparency = 0.3, Parent = Body,
 }, { round(14), stroke(Theme.Accent, 1, 0.8) })
 local Sidebar = create("ScrollingFrame", {
 	Size = UDim2.new(1, 0, 1, -54), BackgroundTransparency = 1, ScrollBarThickness = 0, BorderSizePixel = 0,
@@ -1201,8 +1407,9 @@ renderPin()
 -- Botão quadrado que oculta/mostra o Hub (arrastável). Imagem: BegABaddiesHubIcon.png, ID do Roblox ou emoji.
 local ToggleBtn = create("ImageButton", {
 	Name = "HubToggle", Size = UDim2.fromOffset(58, 58), Position = UDim2.new(0, 20, 0.2, 0),
-	BackgroundColor3 = Theme.Panel, AutoButtonColor = false, ScaleType = Enum.ScaleType.Crop, ZIndex = 50, Parent = Gui,
-}, { round(14), stroke(Theme.Accent, 2, 0.05) })
+	BackgroundColor3 = Theme.Panel, BackgroundTransparency = 0.15, AutoButtonColor = false,
+	ScaleType = Enum.ScaleType.Crop, ZIndex = 50, Parent = Gui,
+}, { round(14), stroke(Theme.Accent, 2, 0.2) })
 local ToggleFace = create("TextLabel", {
 	Text = "🌸", TextSize = 30, Font = Theme.FontBold, TextColor3 = Theme.Text, BackgroundTransparency = 1,
 	Size = UDim2.fromScale(1, 1), ZIndex = 51, Parent = ToggleBtn,
@@ -1246,7 +1453,8 @@ end
 
 -- Fechamento completo: desliga tudo, solta o alvo, desconecta e remove a interface
 function Hub.Destroy()
-	if Hub.Destroyed then return end
+	if Hub.DestroyDone then return end
+	Hub.DestroyDone = true
 	Hub.Destroyed = true
 	pcall(function() Gui.Enabled = false end)
 	for id in pairs(Toggles.State) do
@@ -1280,8 +1488,8 @@ function Notifications.Push(title, text, kind, action)
 	if kind ~= "error" and kind ~= "warn" and not Toggles.Get("notifications") then return end
 	local color = (kind == "error" and Theme.Error) or (kind == "warn" and Theme.Warn) or Theme.Accent2
 	local n = create("CanvasGroup", {
-		Size = UDim2.new(1, 0, 0, action and 90 or 58), BackgroundColor3 = Theme.Panel, GroupTransparency = 1,
-		Parent = Notifications.Holder,
+		Size = UDim2.new(1, 0, 0, action and 90 or 58), BackgroundColor3 = Theme.Panel, BackgroundTransparency = 0.12,
+		GroupTransparency = 1, Parent = Notifications.Holder,
 	}, {
 		round(10), stroke(color, 1.2, 0.3),
 		create("Frame", { Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = color, BorderSizePixel = 0 }),
@@ -1298,8 +1506,8 @@ function Notifications.Push(title, text, kind, action)
 	if action then
 		local b = create("TextButton", {
 			Text = action.text, Font = Theme.FontBold, TextSize = 12, TextColor3 = Color3.new(1, 1, 1),
-			AutoButtonColor = false, BackgroundColor3 = Theme.Accent, Position = UDim2.fromOffset(14, 58),
-			Size = UDim2.new(1, -28, 0, 24), Parent = n,
+			AutoButtonColor = false, BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.2,
+			Position = UDim2.fromOffset(14, 58), Size = UDim2.new(1, -28, 0, 24), Parent = n,
 		}, { round(7) })
 		b.MouseButton1Click:Connect(function()
 			local ok, err = pcall(action.fn)
@@ -1328,8 +1536,8 @@ function Notifications.Buy(text)
 			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
 		})
 		local card = create("CanvasGroup", {
-			Size = UDim2.new(1, 0, 0, 58), BackgroundColor3 = Theme.Panel, GroupTransparency = 1,
-			Parent = Notifications.Holder,
+			Size = UDim2.new(1, 0, 0, 58), BackgroundColor3 = Theme.Panel, BackgroundTransparency = 0.12,
+			GroupTransparency = 1, Parent = Notifications.Holder,
 		}, {
 			round(10), stroke(Theme.Accent2, 1.2, 0.3),
 			create("Frame", { Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = Theme.Accent2, BorderSizePixel = 0 }),
@@ -1468,7 +1676,7 @@ function Page:Toggle(id, label, desc, default)
 	end
 	local sw = create("TextButton", {
 		Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0),
-		Size = UDim2.fromOffset(44, 22), BackgroundColor3 = Theme.Off, Parent = row,
+		Size = UDim2.fromOffset(44, 22), BackgroundColor3 = Theme.Off, BackgroundTransparency = 0.15, Parent = row,
 	}, { round(11) })
 	local knob = create("Frame", {
 		Size = UDim2.fromOffset(16, 16), Position = UDim2.fromOffset(3, 3), BackgroundColor3 = Color3.new(1, 1, 1), Parent = sw,
@@ -1507,10 +1715,12 @@ function Page:Slider(label, min, max, default, decimals, cb, hint, get)
 		TextXAlignment = Enum.TextXAlignment.Right, Parent = row,
 	})
 	local bar = create("Frame", {
-		Position = UDim2.new(0, 12, 0, 32), Size = UDim2.new(1, -24, 0, 6), BackgroundColor3 = Theme.Off, Parent = row,
+		Position = UDim2.new(0, 12, 0, 32), Size = UDim2.new(1, -24, 0, 6), BackgroundColor3 = Theme.Off,
+		BackgroundTransparency = 0.2, Parent = row,
 	}, { round(3) })
 	local fill = create("Frame", {
-		Size = UDim2.fromScale(math.clamp((default - min) / (max - min), 0, 1), 1), BackgroundColor3 = Theme.Accent, Parent = bar,
+		Size = UDim2.fromScale(math.clamp((default - min) / (max - min), 0, 1), 1), BackgroundColor3 = Theme.Accent,
+		BackgroundTransparency = 0.1, Parent = bar,
 	}, { round(3) })
 	local function show(v)
 		fill.Size = UDim2.fromScale(math.clamp((v - min) / (max - min), 0, 1), 1)
@@ -1551,6 +1761,7 @@ function Page:Input(label, default, placeholder, cb)
 	local box = create("TextBox", {
 		Text = default or "", PlaceholderText = placeholder or "", PlaceholderColor3 = Theme.Sub, Font = Theme.Font,
 		TextSize = 12, TextColor3 = Theme.Text, ClearTextOnFocus = false, BackgroundColor3 = Theme.Bg,
+		BackgroundTransparency = 0.2,
 		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.new(0.68, 0, 0, 26),
 		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = row,
 	}, { round(7), stroke(Theme.Accent, 1, 0.6), create("UIPadding", { PaddingLeft = UDim.new(0, 8) }) })
@@ -1562,8 +1773,9 @@ function Page:Button(label, cb)
 	local row = self:Row(36)
 	local b = create("TextButton", {
 		Text = label, Font = Theme.FontBold, TextSize = 13, TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = false,
-		BackgroundColor3 = Theme.Accent, Size = UDim2.new(1, -16, 0, 26), Position = UDim2.fromOffset(8, 5), Parent = row,
-	}, { round(8), create("UIGradient", { Color = ColorSequence.new(Theme.Accent, Color3.fromRGB(109, 60, 220)), Rotation = 90 }) })
+		BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.2,
+		Size = UDim2.new(1, -16, 0, 26), Position = UDim2.fromOffset(8, 5), Parent = row,
+	}, { round(8), create("UIGradient", { Color = ColorSequence.new(Theme.Accent, Theme.AccentDark), Rotation = 90 }) })
 	connect(b.MouseButton1Click, function()
 		tween(b, 0.08, { Size = UDim2.new(1, -20, 0, 24) })
 		task.delay(0.1, function() tween(b, 0.12, { Size = UDim2.new(1, -16, 0, 26) }) end)
@@ -1595,7 +1807,7 @@ function Page:Choice(label, opts, get, set)
 	for i, o in ipairs(opts) do
 		local b = create("TextButton", {
 			Text = o.text, Font = Theme.FontBold, TextSize = 12, TextColor3 = Theme.Text, AutoButtonColor = false,
-			TextScaled = true, BackgroundColor3 = Theme.Off, LayoutOrder = i,
+			TextScaled = true, BackgroundColor3 = Theme.Off, BackgroundTransparency = 0.2, LayoutOrder = i,
 			Size = UDim2.new(1 / #opts, -6 * (#opts - 1) / #opts, 1, 0), Parent = holder,
 		}, { round(8), create("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 8 }),
 			create("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4) }) })
@@ -2563,7 +2775,7 @@ local function RarityList(page, section, info, filter, withMode)
 			local color = RARITY_COLORS[key] or Theme.Accent2
 			local btn = create("TextButton", {
 				Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, 26),
-				BackgroundColor3 = Theme.Bg, LayoutOrder = i, Parent = holder,
+				BackgroundColor3 = Theme.Bg, BackgroundTransparency = 0.35, LayoutOrder = i, Parent = holder,
 			}, { round(8) })
 			create("Frame", {
 				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0), Size = UDim2.fromOffset(10, 10),
