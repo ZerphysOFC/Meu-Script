@@ -1,12 +1,12 @@
 --[[
-    Beg a Baddies Hub (Luau) - v16  |  Zerphys
-    NOVO nesta versão:
-      * Locais do menu Fast Travel em inglês: Market, Forest e Castle (os nomes em português continuam funcionando).
-      * Config. Autofarm > "Local do farm": escolha Mercado, Floresta ou Castelo e o Auto Talk só farma
-        nas redondezas desse local (viaja até lá e usa aquele ponto como centro).
-      * Listas de raridade recolhíveis: a barra mostra só as raridades marcadas; ao clicar, abre a lista
-        completa com Selecionar todas / Desmarcar todas (que somem quando a barra fecha).
-      * Auto Raid (v15): King of Curses / The Strongest pelo nome, ignora o Raid Shop, centros 1 e 2.
+    Beg a Baddies Hub (Luau) - v17  |  Zerphys
+    NOVO nesta versão (otimização, sem mudar o comportamento):
+      * Auto Talk muito mais leve: o texto dos prompts fica em cache, a área/distância é checada antes das
+        verificações pesadas, e a busca de alvo não roda mais a cada tick.
+      * Interface rastreada por eventos (em vez de varrer o PlayerGui inteiro várias vezes por segundo):
+        botão BEG!, detector do minigame e leitura do dinheiro.
+      * Detector do minigame: varredura pesada só quando precisa e lista de elementos em cache curto.
+    Inclui tudo da v16 (locais Market/Forest/Castle, Local do farm, raridades recolhíveis) e do Auto Raid.
 ]]
 
 local Players = game:GetService("Players")
@@ -290,6 +290,21 @@ for _, d in ipairs(workspace:GetDescendants()) do track(d) end
 connect(workspace.DescendantAdded, track)
 connect(workspace.DescendantRemoving, function(d) Prompts[d] = nil end)
 
+-- Textos/botões da interface rastreados por eventos: evita varrer o PlayerGui inteiro toda hora
+local Tracked = { texts = {}, started = false }
+local function trackGui(d)
+	if d:IsA("TextLabel") or d:IsA("TextButton") then Tracked.texts[d] = true end
+end
+function Utils.startTracking()
+	if Tracked.started then return end
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if not pg then return end
+	Tracked.started = true
+	for _, d in ipairs(pg:GetDescendants()) do trackGui(d) end
+	connect(pg.DescendantAdded, trackGui)
+	connect(pg.DescendantRemoving, function(d) Tracked.texts[d] = nil end)
+end
+
 local function matches(text, words)
 	for _, w in ipairs(words) do
 		if #w <= 3 then
@@ -339,7 +354,7 @@ function Utils.isBlacklisted(p)
 	local list = Configuration.Blacklist
 	if not list or #list == 0 then return false end
 	local c = BlackCache[p]
-	if not c or os.clock() - c.t > 5 then
+	if not c or os.clock() - c.t > 15 then
 		c = { text = blackText(p), t = os.clock() }
 		BlackCache[p] = c
 	end
@@ -385,7 +400,7 @@ end
 
 function Utils.rarityInfo(p)
 	local c = RarityCache[p]
-	if c and ((c.rank and c.income > 0) or os.clock() - c.t < 4) then return c.rank, c.income end
+	if c and ((c.rank and c.income > 0) or os.clock() - c.t < (c.rank and 20 or 5)) then return c.rank, c.income end
 	local rank
 	local node = p
 	for _ = 1, 6 do
@@ -527,13 +542,20 @@ local function onScreen(g)
 	local vp, pos, size = cam.ViewportSize, g.AbsolutePosition, g.AbsoluteSize
 	return pos.X + size.X > 0 and pos.Y + size.Y > 0 and pos.X < vp.X and pos.Y < vp.Y
 end
+local begScanAt = 0
 function Utils.findBeg()
 	if begCache and begCache.Parent and Utils.shown(begCache) and onScreen(begCache) then return begCache end
 	begCache = nil
+	local now = os.clock()
+	local mg = Utils.Minigame
+	local gap = (mg and now < mg.windowUntil) and 0.12 or 0.5
+	if now - begScanAt < gap then return nil end
+	begScanAt = now
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
 	if not pg then return nil end
-	for _, g in ipairs(pg:GetDescendants()) do
-		if (g:IsA("TextButton") or g:IsA("TextLabel")) and g.AbsoluteSize.X > 0 and g.AbsoluteSize.Y > 0 then
+	Utils.startTracking()
+	for g in pairs(Tracked.texts) do
+		if g.Visible and g.AbsoluteSize.X > 0 and g.AbsoluteSize.Y > 0 then
 			local t = g.Text:gsub("<[^>]+>", "")
 			t = t:gsub("%s", ""):lower()
 			if t == "beg!" and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) and Utils.shown(g) and onScreen(g) then
@@ -602,11 +624,34 @@ local function valid(t)
 end
 local function release() Lock.target, Lock.id, Lock.engaged, Lock.offSince = nil, nil, false, nil end
 
+local NpcCache = setmetatable({}, { __mode = "k" })
 local function npcPrompt(p)
+	local c = NpcCache[p]
+	if c and os.clock() - c.t < 10 then return c.v end
+	local v = false
 	local model = p:FindFirstAncestorOfClass("Model")
-	if not model or Players:GetPlayerFromCharacter(model) then return false end
-	return model:FindFirstChildWhichIsA("Humanoid", true) ~= nil
-		or model:FindFirstChildWhichIsA("AnimationController", true) ~= nil
+	if model and not Players:GetPlayerFromCharacter(model) then
+		v = model:FindFirstChildWhichIsA("Humanoid", true) ~= nil
+			or model:FindFirstChildWhichIsA("AnimationController", true) ~= nil
+	end
+	NpcCache[p] = { v = v, t = os.clock() }
+	return v
+end
+
+-- Texto/peça de cada prompt em cache (GetFullName e lower() são caros em milhares de prompts)
+local PromptInfo = setmetatable({}, { __mode = "k" })
+local function promptInfo(p)
+	local c = PromptInfo[p]
+	local now = os.clock()
+	if c and now - c.t < 6 then return c end
+	local part = p.Parent
+	if part and part:IsA("Attachment") then part = part.Parent end
+	c = {
+		text = (p.ObjectText .. " " .. p.ActionText .. " " .. p:GetFullName()):lower(),
+		part = part, t = now, kw = setmetatable({}, { __mode = "k" }), ex = setmetatable({}, { __mode = "k" }),
+	}
+	PromptInfo[p] = c
+	return c
 end
 
 function Utils.pickTarget(keywords, exclude, fallback)
@@ -621,40 +666,59 @@ function Utils.pickTarget(keywords, exclude, fallback)
 	if keywords == Configuration.Keywords.Rift then
 		center, radius = hrp.Position, Configuration.RiftRadius
 	end
+	local hpos = hrp.Position
+	local noArea = Configuration.NoArea[keywords]
+	local now = os.clock()
 	local best
 	for pass = 1, 2 do
 		if pass == 2 and (best or not (fallback and Configuration.NpcFallback)) then break end
 		for p in pairs(Prompts) do
 			local ig = Ignored[p]
-			if p.Enabled and p:IsDescendantOf(workspace) and not (ig and os.clock() < ig) then
-				local text = (p.ObjectText .. " " .. p.ActionText .. " " .. p:GetFullName()):lower()
-				local ok
-				if pass == 1 then ok = matches(text, keywords) else ok = npcPrompt(p) end
-				if ok and not (exclude and matches(text, exclude)) and not Utils.isBlacklisted(p) then
-					local part = p.Parent
-					if part and part:IsA("Attachment") then part = part.Parent end
-					if part and part:IsA("BasePart") then
-						local d = (hrp.Position - part.Position).Magnitude
-						if Configuration.NoArea[keywords] or (center - part.Position).Magnitude <= radius then
-							local rank, income, allowed = 0, 0, true
-							if rareOn or filterOn then
-								local r, inc = Utils.rarityInfo(p)
-								rank, income = r or 0, inc or 0
-								if filterOn then
-									local nm = r and Configuration.RarityOrder[r]
-									if nm then
-										if Configuration.RarityFilter[nm:lower()] then
-											rank += 100
-										elseif Configuration.StrictRarity then
-											allowed = false
-										end
+			if p.Enabled and not (ig and now < ig) and p:IsDescendantOf(workspace) then
+				local info = promptInfo(p)
+				local part = info.part
+				-- 1) o mais barato primeiro: é peça e está dentro da área?
+				if part and part:IsA("BasePart") and (noArea or (center - part.Position).Magnitude <= radius) then
+					-- 2) bate com as palavras (resultado em cache por prompt)?
+					local ok
+					if pass == 1 then
+						ok = info.kw[keywords]
+						if ok == nil then
+							ok = matches(info.text, keywords)
+							info.kw[keywords] = ok
+						end
+					else
+						ok = npcPrompt(p)
+					end
+					if ok and exclude then
+						local ex = info.ex[exclude]
+						if ex == nil then
+							ex = matches(info.text, exclude)
+							info.ex[exclude] = ex
+						end
+						if ex then ok = false end
+					end
+					-- 3) só agora as checagens pesadas (lista de bloqueio e raridade)
+					if ok and not Utils.isBlacklisted(p) then
+						local d = (hpos - part.Position).Magnitude
+						local rank, income, allowed = 0, 0, true
+						if rareOn or filterOn then
+							local r, inc = Utils.rarityInfo(p)
+							rank, income = r or 0, inc or 0
+							if filterOn then
+								local nm = r and Configuration.RarityOrder[r]
+								if nm then
+									if Configuration.RarityFilter[nm:lower()] then
+										rank += 100
+									elseif Configuration.StrictRarity then
+										allowed = false
 									end
 								end
 							end
-							if allowed and (not best or rank > best.rank
-								or (rank == best.rank and (income > best.income or (income == best.income and d < best.dist)))) then
-								best = { prompt = p, part = part, dist = d, rank = rank, income = income }
-							end
+						end
+						if allowed and (not best or rank > best.rank
+							or (rank == best.rank and (income > best.income or (income == best.income and d < best.dist)))) then
+							best = { prompt = p, part = part, dist = d, rank = rank, income = income }
 						end
 					end
 				end
@@ -683,6 +747,8 @@ function Utils.lockedTarget(id, keywords, exclude, fallback)
 		end
 	end
 	if not Lock.target then
+		if os.clock() < (Lock.nextPick or 0) then return nil end
+		Lock.nextPick = os.clock() + 0.4
 		local best = Utils.pickTarget(keywords, exclude, fallback)
 		if best then
 			Lock.target, Lock.id, Lock.since, Lock.engaged, Lock.lastFire = best, id, os.clock(), false, 0
@@ -692,7 +758,7 @@ function Utils.lockedTarget(id, keywords, exclude, fallback)
 			Lock.clearedAt = os.clock()
 			for k in pairs(Ignored) do Ignored[k] = nil end
 		end
-	elseif Lock.id == id and not Lock.engaged and os.clock() - (Lock.repickAt or 0) > 1 then
+	elseif Lock.id == id and not Lock.engaged and os.clock() - (Lock.repickAt or 0) > 1.5 then
 		Lock.repickAt = os.clock()
 		local best = Utils.pickTarget(keywords, exclude, fallback)
 		if best and (best.rank > Lock.target.rank
@@ -778,10 +844,12 @@ local function watchGone(w)
 	if model and not model:IsDescendantOf(workspace) then return true end
 	if w.pos and (part.Position - w.pos).Magnitude > 60 then return true end
 	if w.hadVisible and model then
+		if os.clock() - (w.at or 0) < 0.4 then return w.res == true end
+		w.at, w.res = os.clock(), true
 		for _, d in ipairs(model:GetDescendants()) do
-			if d:IsA("BasePart") and d.Transparency < 0.95 then return false end
+			if d:IsA("BasePart") and d.Transparency < 0.95 then w.res = false break end
 		end
-		return true
+		return w.res
 	end
 	return false
 end
@@ -946,7 +1014,7 @@ local function chip(text, x, w, color)
 		Position = UDim2.new(0, x, 0.5, 0), Size = UDim2.fromOffset(w, 24), Parent = Header,
 	}, { round(12), stroke(Theme.Accent, 1, 0.75) })
 end
-chip("v16", 206, 40, Theme.Accent2)
+chip("v17", 206, 40, Theme.Accent2)
 local StatusChip = chip("", 252, 138)
 local StatusDot = create("Frame", {
 	AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.fromOffset(7, 7),
@@ -1593,12 +1661,21 @@ function Utils.badPath(node)
 end
 
 local textCache = setmetatable({}, { __mode = "k" })
+local badCache = setmetatable({}, { __mode = "k" })
+local function badCached(g)
+	local c = badCache[g]
+	if not c or os.clock() - c.t > 10 then
+		c = { v = Utils.badPath(g), t = os.clock() }
+		badCache[g] = c
+	end
+	return c.v
+end
 function Utils.buttons(allowHidden)
 	local out = {}
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
 	if not pg then return out end
 	for _, g in ipairs(pg:GetDescendants()) do
-		if g:IsA("GuiButton") and not Utils.badPath(g) then
+		if g:IsA("GuiButton") and not badCached(g) then
 			local shown = Utils.shown(g)
 			if shown or (allowHidden and CAN_HIDDEN) then
 				local c = textCache[g]
@@ -1631,7 +1708,8 @@ function Utils.money()
 	local cam = workspace.CurrentCamera
 	local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
 	if pg then
-		for _, g in ipairs(pg:GetDescendants()) do
+		Utils.startTracking()
+		for g in pairs(Tracked.texts) do
 			if g:IsA("TextLabel") and g.Text:find("%$") and Utils.shown(g) and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) then
 				local t = cleanLower(g.Text):gsub("%s", "")
 				if t:match("^%$[%d%.,]+%a*$") then
@@ -1728,7 +1806,8 @@ local Modules = {}
 
 -- Beg (minigame): sem página. Liga junto com o Auto Talk, acha a zona vermelha sozinho e aperta E.
 Modules.Combat = { Init = function()
-	local auto = { zone = nil, marker = nil, samples = {}, roots = nil, rootsAt = 0, t = 0 }
+	local auto = { zone = nil, marker = nil, samples = {}, roots = nil, rootsAt = 0, t = 0,
+		dcache = setmetatable({}, { __mode = "k" }) }
 	local prev, velS, moveAt, stale, beat = nil, 0, 0, false, nil
 	local roundState = { presses = 0, last = 0 }
 
@@ -1747,37 +1826,54 @@ Modules.Combat = { Init = function()
 			or t:find("na zona", 1, true) ~= nil or t:find("in the zone", 1, true) ~= nil
 	end
 
+	local lastHeavy = 0
 	local function collectRoots(pg)
-		local roots, seen, reds = {}, {}, {}
+		local roots, seen = {}, {}
 		local function add(r)
 			if r and r ~= pg and r:IsA("GuiObject") and not seen[r] then
 				seen[r] = true
 				table.insert(roots, r)
 			end
 		end
-		for _, g in ipairs(pg:GetDescendants()) do
-			if g:IsA("GuiObject") and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) then
-				if (g:IsA("TextLabel") or g:IsA("TextButton")) and g.Text ~= "" and isPressText(g) and Utils.shown(g) then
-					local a = g.Parent
-					for _ = 1, 3 do add(a) a = a and a.Parent end
-				elseif g.AbsoluteSize.X > 4 and g.AbsoluteSize.Y > 4 and Utils.isRed(g) and Utils.shown(g) then
-					table.insert(reds, g)
-				end
+		-- caminho rápido: textos "Pressione E / na zona" já rastreados
+		Utils.startTracking()
+		for g in pairs(Tracked.texts) do
+			if g.Visible and g.Text ~= "" and isPressText(g)
+				and not (Hub.Gui and g:IsDescendantOf(Hub.Gui)) and Utils.shown(g) then
+				local a = g.Parent
+				for _ = 1, 3 do add(a) a = a and a.Parent end
 			end
 		end
+		-- caminho pesado (zona vermelha): só de vez em quando
 		if #roots == 0 then
-			for _, g in ipairs(reds) do
-				local a = g.Parent
-				for _ = 1, 4 do add(a) a = a and a.Parent end
+			local now = os.clock()
+			if now - lastHeavy >= ((now < Mini.windowUntil) and 0.6 or 2.5) then
+				lastHeavy = now
+				for _, g in ipairs(pg:GetDescendants()) do
+					if g:IsA("GuiObject") and not (Hub.Gui and g:IsDescendantOf(Hub.Gui))
+						and g.AbsoluteSize.X > 4 and g.AbsoluteSize.Y > 4 and Utils.isRed(g) and Utils.shown(g) then
+						local a = g.Parent
+						for _ = 1, 4 do add(a) a = a and a.Parent end
+					end
+				end
 			end
 		end
 		return roots
 	end
 
+	-- lista de descendentes em cache curto (o minigame é lido a cada frame)
+	local function descOf(root)
+		local c = auto.dcache[root]
+		if c and os.clock() - c.t < 0.35 then return c.d end
+		local d = root:GetDescendants()
+		auto.dcache[root] = { d = d, t = os.clock() }
+		return d
+	end
+
 	local function scanRoots(roots, samples)
 		local newSamples = {}
 		for _, root in ipairs(roots) do
-			local desc = root:GetDescendants()
+			local desc = descOf(root)
 			local reds = {}
 			for _, g in ipairs(desc) do
 				if g:IsA("GuiObject") and g.AbsoluteSize.X > 4 and g.AbsoluteSize.Y > 4 and Utils.isRed(g) and Utils.shown(g) then
@@ -1822,7 +1918,7 @@ Modules.Combat = { Init = function()
 			auto.zone, auto.marker, auto.samples = nil, nil, {}
 		end
 		auto.t += dt
-		local need = auto.roots and 0 or ((os.clock() < Mini.windowUntil) and 0.1 or 0.5)
+		local need = auto.roots and 0 or ((os.clock() < Mini.windowUntil) and 0.12 or 1.2)
 		if auto.t < need then return nil end
 		auto.t = 0
 		if auto.roots and not (auto.roots[1] and auto.roots[1].Parent and Utils.shown(auto.roots[1])) then
@@ -2551,7 +2647,7 @@ Modules.Alerts = { Init = function()
 				if model and part and part:IsA("BasePart") and not Players:GetPlayerFromCharacter(model) then
 					local st = seen[model]
 					if not st then
-						local text = (p.ObjectText .. " " .. p.ActionText .. " " .. p:GetFullName()):lower()
+						local text = promptInfo(p).text
 						if matches(text, Configuration.Keywords.Talk) or npcPrompt(p) then
 							st = { tries = 0, done = false, pos = part.Position, part = part }
 							seen[model] = st
@@ -2919,6 +3015,7 @@ end }
 -- Inicialização
 --==================================================================
 Configuration.ApplySpeed()
+Utils.startTracking()
 Modules.Combat.Init()
 Modules.Movement.Init()
 Modules.Alerts.Init()
