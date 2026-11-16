@@ -1,0 +1,789 @@
+-- Red X Hub v5 (auto-reexecucao apos server hop)
+-- Execute este arquivo UMA vez. Ele salva uma copia em RedXHub/script.lua
+-- e, a cada server hop, o script roda sozinho no novo servidor.
+local SRC = [==[
+-- Red X Hub v5 | Sailor Piece
+-- Foco em UM X por vez + todas as ilhas (Soul Dominion, World, Easter, Ghost Ship)
+-- + aba Configuracoes (salvar / autoload / excluir)
+-- + SERVER HOP: troca de servidor quando varrer todas as ilhas e nao achar nenhum Red X
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+if getgenv().RedXHub then
+    pcall(function() getgenv().RedXHub:Unload() end)
+end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Plr = Players.LocalPlayer
+
+local TP_Portal = RS:WaitForChild("Remotes"):WaitForChild("TeleportToPortal")
+
+local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+getgenv().RedXHub = Library
+local Toggles, Options = Library.Toggles, Library.Options
+
+----------------------------------------------------------------
+-- ILHAS
+-- Cada entrada = lista de nomes possiveis pro TP_Portal (o 1o e o "principal").
+-- Quando ha mais de um nome, o script testa um por um ate o personagem se mover.
+----------------------------------------------------------------
+local ISLAND_DEFS = {
+    {"Starter"}, {"Jungle"}, {"Desert"}, {"Snow"}, {"Sailor"}, {"Shibuya"},
+    {"HuecoMundo"}, {"Boss"}, {"Dungeon"}, {"Shinjuku"}, {"Valentine"},
+    {"Slime"}, {"Academy"}, {"Judgement"},
+    {"SoulDominion", "SoulSociety", "Soul"},   -- Soul Dominion
+    {"Tower"},
+    {"World", "WorldIsland"},                  -- World Island
+}
+local EXTRA_DEFS = {
+    {"Easter", "EasterIsland"},
+    {"GhostShip", "Ghost Ship", "Ghost"},
+    {"Ninja"}, {"Lawless"},
+}
+
+local ALIASES, ISLANDS, EXTRA_ISLANDS = {}, {}, {}
+for _, def in ipairs(ISLAND_DEFS) do ALIASES[def[1]] = def table.insert(ISLANDS, def[1]) end
+for _, def in ipairs(EXTRA_DEFS) do ALIASES[def[1]] = def table.insert(EXTRA_ISLANDS, def[1]) end
+
+local CRYSTALS = {
+    Starter = {"StarterIsland", "SpawnPointCrystal_Starter"},
+    Jungle = {"JungleIsland", "SpawnPointCrystal_Jungle"},
+    Desert = {"DesertIsland", "SpawnPointCrystal_Desert"},
+    Snow = {"SnowIsland", "SpawnPointCrystal_Snow"},
+    Sailor = {"SailorIsland", "SpawnPointCrystal_Sailor"},
+    Shibuya = {"ShibuyaStation", "SpawnPointCrystal_Shibuya"},
+    HuecoMundo = {"HuecoMundo", "SpawnPointCrystal_HuecoMundo"},
+    Boss = {"BossIsland", "SpawnPointCrystal_Boss"},
+    Dungeon = {"Main Temple", "SpawnPointCrystal_Dungeon"},
+    Shinjuku = {"ShinjukuIsland", "SpawnPointCrystal_Shinjuku"},
+    Valentine = {"ValentineIsland", "SpawnPointCrystal_Valentine"},
+    Slime = {"SlimeIsland", "SpawnPointCrystal_Slime"},
+    Academy = {"AcademyIsland", "SpawnPointCrystal_Academy"},
+    Judgement = {"JudgementIsland", "SpawnPointCrystal_Judgement"},
+    SoulDominion = {"SoulDominionIsland", "SpawnPointCrystal_SoulDominion"},
+    Tower = {"TowerIsland", "SpawnPointCrystal_Tower"},
+    Ninja = {"NinjaIsland", "SpawnPointCrystal_Ninja"},
+    Lawless = {"LawlessIsland", "SpawnPointCrystal_Lawless"},
+}
+
+local State = {
+    Running = true,
+    Skipped = {},
+    Lock = nil,
+    Tween = nil,
+    Flying = false,
+    CustomName = "",
+    IslandIdx = 1,
+    IslandPos = {},
+    GoodAlias = {},
+    Status = "parado",
+    Hopping = false,
+    TriedServers = {},
+}
+
+-- declarada aqui, definida mais abaixo (depois do sistema de save)
+local serverHop
+
+----------------------------------------------------------------
+-- UTIL
+----------------------------------------------------------------
+local function getRoot()
+    local c = Plr.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function posOf(inst)
+    if not inst or not inst.Parent then return nil end
+    if inst:IsA("BasePart") then return inst.Position end
+    if inst:IsA("Model") then return inst:GetPivot().Position end
+end
+
+local function norm(s)
+    return (tostring(s):lower():gsub("[%s_%-%.]", ""))
+end
+
+local function isCharacterPart(v)
+    local m = v:FindFirstAncestorOfClass("Model")
+    while m do
+        if m:FindFirstChildOfClass("Humanoid") then return true end
+        m = m.Parent and m.Parent:FindFirstAncestorOfClass("Model")
+    end
+    return false
+end
+
+local npcFolder = workspace:FindFirstChild("NPCs")
+local serviceFolder = workspace:FindFirstChild("ServiceNPCs")
+
+local function textMatches(text)
+    local n = norm(text)
+    if State.CustomName ~= "" then
+        return n:find(norm(State.CustomName), 1, true) ~= nil
+    end
+    return n:find("redx", 1, true) ~= nil
+        or n == "x"
+        or n:find("xmark", 1, true) ~= nil
+end
+
+local function matchTarget(v)
+    if v:IsA("ProximityPrompt") then
+        if textMatches(v.Name) or textMatches(v.ActionText) or textMatches(v.ObjectText) then
+            return v.Parent
+        end
+        return nil
+    end
+    if v:IsA("ClickDetector") then
+        if State.CustomName ~= "" and textMatches(v.Name) then return v.Parent end
+        return nil
+    end
+    if v:IsA("BasePart") or v:IsA("Model") then
+        if textMatches(v.Name) then return v end
+    end
+    return nil
+end
+
+local function scanAll(includeSkipped)
+    local found, seen = {}, {}
+    for _, v in ipairs(workspace:GetDescendants()) do
+        local t = matchTarget(v)
+        if t and t.Parent and not seen[t]
+            and not (npcFolder and t:IsDescendantOf(npcFolder))
+            and not (serviceFolder and t:IsDescendantOf(serviceFolder))
+            and not isCharacterPart(t) then
+            if includeSkipped or not State.Skipped[t] then
+                seen[t] = true
+                found[#found + 1] = t
+            end
+        end
+    end
+    return found
+end
+
+local function nearestFrom(list, from)
+    local best, bestD = nil, math.huge
+    for _, t in ipairs(list) do
+        local p = posOf(t)
+        if p then
+            local d = (p - from).Magnitude
+            if d < bestD then best, bestD = t, d end
+        end
+    end
+    return best
+end
+
+local function nearestIsland(pos)
+    local best, bestD = nil, math.huge
+    for name, p in pairs(CRYSTALS) do
+        local folder = workspace:FindFirstChild(p[1])
+        local crystal = folder and folder:FindFirstChild(p[2])
+        if crystal then State.IslandPos[name] = crystal:GetPivot().Position end
+    end
+    for name, ip in pairs(State.IslandPos) do
+        local d = (ip - pos).Magnitude
+        if d < bestD then best, bestD = name, d end
+    end
+    return best
+end
+
+----------------------------------------------------------------
+-- MOVIMENTO
+----------------------------------------------------------------
+local moveConn = RunService.Stepped:Connect(function()
+    if not State.Flying then return end
+    local c = Plr.Character
+    if c then
+        for _, p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+        local r = c:FindFirstChild("HumanoidRootPart")
+        if r then r.AssemblyLinearVelocity = Vector3.zero end
+    end
+end)
+
+local function flyTo(pos)
+    local root = getRoot()
+    if not root then return false end
+    State.Flying = true
+
+    local dist = (root.Position - pos).Magnitude
+    local time = math.max(dist / Options.FlySpeed.Value, 0.05)
+    local tw = TweenService:Create(root, TweenInfo.new(time, Enum.EasingStyle.Linear), {
+        CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+    })
+    State.Tween = tw
+    tw:Play()
+    local st = tw.Completed:Wait()
+    State.Tween = nil
+
+    State.Flying = false
+    local r = getRoot()
+    if r then r.AssemblyLinearVelocity = Vector3.zero end
+    return st == Enum.PlaybackState.Completed and Toggles.GoToX.Value
+end
+
+-- TP para a ilha. Se ela tem varios nomes possiveis, testa ate o personagem se mover.
+local function tpIsland(island)
+    State.Status = "TP para ilha: " .. island
+    local defs = ALIASES[island] or {island}
+    local names = {}
+    if State.GoodAlias[island] then table.insert(names, State.GoodAlias[island]) end
+    for _, n in ipairs(defs) do
+        if n ~= State.GoodAlias[island] then table.insert(names, n) end
+    end
+
+    for i, name in ipairs(names) do
+        local root = getRoot()
+        local before = root and root.Position
+        TP_Portal:FireServer(name)
+        task.wait(i == 1 and Options.IslandWait.Value or 1.5)
+
+        root = getRoot()
+        if #names == 1 then break end
+        if root and before and (root.Position - before).Magnitude > 80 then
+            State.GoodAlias[island] = name
+            break
+        end
+    end
+
+    local r = getRoot()
+    if r then State.IslandPos[island] = r.Position end
+end
+
+local function dropLock(markSkipped)
+    local L = State.Lock
+    if L and markSkipped and L.inst then State.Skipped[L.inst] = true end
+    State.Lock = nil
+end
+
+local function skipCurrent()
+    dropLock(true)
+    if State.Tween then State.Tween:Cancel() end
+    State.Flying = false
+    Library:Notify("Alvo pulado. Escolhendo outro...", 2)
+end
+
+----------------------------------------------------------------
+-- ACHAR / TRAVAR UM ALVO
+----------------------------------------------------------------
+local function lockOn(inst, island)
+    local pos = posOf(inst)
+    if not pos then return false end
+    island = island or nearestIsland(pos)
+    State.Lock = { inst = inst, pos = pos, island = island, name = inst.Name, tries = 0, hits = 0 }
+    Library:Notify("Foco: " .. inst.Name .. (island and (" (" .. island .. ")") or ""), 3)
+    return true
+end
+
+-- Retorna false SO depois de checar o lugar atual + TODAS as ilhas da lista
+-- sem achar nenhum X (e a condicao pro server hop).
+local function acquire()
+    State.Status = "Procurando X..."
+    local list = table.clone(ISLANDS)
+    if Toggles.ExtraIslands.Value then
+        for _, n in ipairs(EXTRA_ISLANDS) do table.insert(list, n) end
+    end
+
+    local root = getRoot()
+    if root then
+        local t = nearestFrom(scanAll(false), root.Position)
+        if t then return lockOn(t) end
+    end
+
+    for _ = 1, #list do
+        if not Toggles.GoToX.Value then return false end
+        if State.IslandIdx > #list then State.IslandIdx = 1 end
+        local island = list[State.IslandIdx]
+        State.IslandIdx += 1
+
+        tpIsland(island)
+        root = getRoot()
+        if root then
+            local t = nearestFrom(scanAll(false), root.Position)
+            if t then return lockOn(t, island) end
+        end
+    end
+    return false
+end
+
+local function resolveLock(L)
+    if L.inst and L.inst.Parent then return L.inst end
+    local near
+    local bestD = 120
+    for _, t in ipairs(scanAll(false)) do
+        local p = posOf(t)
+        if p then
+            local d = (p - L.pos).Magnitude
+            if d < bestD then near, bestD = t, d end
+        end
+    end
+    return near
+end
+
+----------------------------------------------------------------
+-- INTERACAO
+----------------------------------------------------------------
+local function interact(target)
+    local prompts = {}
+    if target:IsA("ProximityPrompt") then table.insert(prompts, target) end
+    for _, d in ipairs(target:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then table.insert(prompts, d) end
+    end
+    local chosen = prompts[1]
+    if State.CustomName ~= "" then
+        for _, p in ipairs(prompts) do
+            if textMatches(p.Name) or textMatches(p.ActionText) or textMatches(p.ObjectText) then
+                chosen = p break
+            end
+        end
+    end
+    if chosen and fireproximityprompt then
+        chosen.HoldDuration = 0
+        chosen.RequiresLineOfSight = false
+        fireproximityprompt(chosen)
+        return true
+    end
+    local click = target:FindFirstChildWhichIsA("ClickDetector", true)
+    if click and fireclickdetector then
+        fireclickdetector(click)
+        return true
+    end
+    return false
+end
+
+----------------------------------------------------------------
+-- LOOP PRINCIPAL (foco em UM alvo por vez)
+----------------------------------------------------------------
+local function MainLoop()
+    while State.Running and Toggles.GoToX.Value do
+        task.wait(0.2)
+        if State.Hopping then continue end
+
+        local root = getRoot()
+        if not root then continue end
+
+        if not State.Lock then
+            if not acquire() then
+                if not Toggles.GoToX.Value then break end
+
+                -- varreu todas as ilhas e nao achou nenhum X
+                if Toggles.AutoHop.Value then
+                    State.Status = "Nenhum X em nenhuma ilha. Server hop..."
+                    Library:Notify("Nenhum X em nenhuma ilha. Trocando de servidor...", 4)
+                    table.clear(State.Skipped)
+                    State.IslandIdx = 1
+                    task.spawn(serverHop)
+                    continue
+                end
+
+                State.Status = "Nenhum X no mapa todo"
+                if Toggles.ClearWhenEmpty.Value then table.clear(State.Skipped) end
+                task.wait(3)
+                continue
+            end
+        end
+
+        local L = State.Lock
+        if not L then continue end
+
+        root = getRoot()
+        if L.island and root and (root.Position - L.pos).Magnitude > Options.FarDist.Value then
+            tpIsland(L.island)
+        end
+
+        local inst = resolveLock(L)
+        if inst then
+            L.inst = inst
+            L.pos = posOf(inst) or L.pos
+        end
+
+        State.Status = "Indo para: " .. L.name .. (L.island and (" [" .. L.island .. "]") or "")
+        if not flyTo(L.pos) then continue end
+        if State.Lock ~= L then continue end
+
+        task.wait(0.15)
+        inst = resolveLock(L)
+        if not inst then
+            root = getRoot()
+            if root and (root.Position - L.pos).Magnitude < 60 then
+                Library:Notify(L.name .. " sumiu. Trocando de alvo.", 3)
+                dropLock(false)
+            else
+                L.tries += 1
+                if L.tries >= 3 then dropLock(true) end
+            end
+            continue
+        end
+        L.inst = inst
+        L.pos = posOf(inst) or L.pos
+
+        State.Status = "Coletando: " .. L.name
+        if Toggles.AutoInteract.Value then
+            if not interact(inst) then
+                Library:Notify("Sem prompt/click em: " .. inst:GetFullName(), 3)
+            end
+        end
+        task.wait(Options.InteractDelay.Value)
+
+        if not inst.Parent then
+            dropLock(false)
+        else
+            L.hits += 1
+            if L.hits >= 3 then dropLock(true) end
+        end
+    end
+    State.Flying = false
+    if not State.Hopping then State.Status = "parado" end
+end
+
+local MainThread
+local function RunMain(on)
+    if on then
+        if not MainThread or coroutine.status(MainThread) == "dead" then
+            MainThread = task.spawn(MainLoop)
+        end
+    else
+        if State.Tween then State.Tween:Cancel() end
+        State.Flying = false
+        State.Lock = nil
+    end
+end
+
+----------------------------------------------------------------
+-- UI
+----------------------------------------------------------------
+local Window = Library:CreateWindow({
+    Title = "Red X Hub",
+    Footer = "Sailor Piece | v5",
+    Icon = "map-pin",
+    NotifySide = "Right",
+    ShowCustomCursor = true,
+    AutoShow = true,
+    Center = true,
+    Font = Enum.Font.RobotoMono,
+})
+
+local Tab = Window:AddTab("Red X", "map-pin")
+local SettingsTab = Window:AddTab("Configuracoes", "settings")
+local Main = Tab:AddLeftGroupbox("Controle", "target")
+local Config = Tab:AddRightGroupbox("Config", "wrench")
+
+local StatusLabel = Main:AddLabel("Status: parado", true)
+
+Main:AddToggle("GoToX", {
+    Text = "Ir para o Red X (foco em 1)",
+    Default = false,
+    Callback = function(v) RunMain(v) end,
+})
+
+Main:AddButton({ Text = "Proximo X", Func = skipCurrent })
+
+Main:AddButton({
+    Text = "Server hop agora",
+    Func = function() task.spawn(serverHop) end,
+})
+
+Main:AddButton({
+    Text = "Limpar lista de pulados",
+    Func = function()
+        table.clear(State.Skipped)
+        Library:Notify("Lista limpa.", 2)
+    end,
+})
+
+Main:AddDivider()
+
+Main:AddInput("TargetName", {
+    Text = "Nome do botao/alvo (opcional)",
+    Default = "",
+    Placeholder = "vazio = Red X",
+    Finished = true,
+    ClearTextOnFocus = false,
+    Callback = function(v)
+        State.CustomName = ((v or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+        table.clear(State.Skipped)
+        dropLock(false)
+        if State.Tween then State.Tween:Cancel() end
+        Library:Notify(State.CustomName == "" and "Busca padrao: Red X" or ("Procurando: " .. State.CustomName), 3)
+    end,
+})
+
+Main:AddToggle("AutoInteract", { Text = "Interagir automaticamente", Default = true })
+
+Main:AddDivider()
+
+Main:AddButton({
+    Text = "Escanear mapa (debug)",
+    Func = function()
+        local root = getRoot()
+        local lines = {}
+        for _, t in ipairs(scanAll(true)) do
+            local p = posOf(t)
+            local d = (root and p) and math.floor((root.Position - p).Magnitude) or -1
+            lines[#lines + 1] = string.format("%s  [%d studs]", t:GetFullName(), d)
+        end
+        if #lines == 0 then
+            Library:Notify("Nada carregado agora. Ligue o toggle para ele varrer as ilhas.", 5)
+            return
+        end
+        local out = table.concat(lines, "\n")
+        print("=== RED X ENCONTRADOS ===\n" .. out)
+        if setclipboard then setclipboard(out) end
+        Library:Notify(#lines .. " encontrado(s). Veja o console (F9) / clipboard.", 5)
+    end,
+})
+
+Config:AddToggle("AutoHop", { Text = "Server hop quando nao achar nenhum X", Default = true })
+Config:AddToggle("ExtraIslands", { Text = "Incluir Easter/Ghost Ship/Ninja/Lawless", Default = true })
+Config:AddToggle("ClearWhenEmpty", { Text = "Reiniciar lista quando acabar (sem hop)", Default = true })
+
+Config:AddInput("ScriptURL", {
+    Text = "URL do script (so se nao salvar arquivo)",
+    Default = "",
+    Placeholder = "https://... (opcional)",
+    Finished = true,
+    ClearTextOnFocus = false,
+})
+
+Config:AddSlider("IslandWait", { Text = "Espera apos TP de ilha (s)", Default = 2.5, Min = 1, Max = 6, Rounding = 1 })
+Config:AddSlider("FlySpeed", { Text = "Velocidade do voo", Default = 220, Min = 20, Max = 600, Rounding = 0 })
+Config:AddSlider("FarDist", { Text = "Dist. p/ usar TP de ilha", Default = 300, Min = 50, Max = 2000, Rounding = 0 })
+Config:AddSlider("InteractDelay", { Text = "Delay apos interagir (s)", Default = 1.5, Min = 0, Max = 10, Rounding = 1 })
+
+Config:AddDivider()
+Config:AddButton({
+    Text = "Descarregar Hub",
+    Func = function()
+        State.Running = false
+        if State.Tween then State.Tween:Cancel() end
+        moveConn:Disconnect()
+        getgenv().RedXHub = nil
+        Library:Unload()
+    end,
+})
+
+----------------------------------------------------------------
+-- ABA CONFIGURACOES (salvar / autoload / excluir)
+----------------------------------------------------------------
+local FOLDER = "RedXHub"
+local CFG_FILE = FOLDER .. "/config.json"
+local AUTO_FILE = FOLDER .. "/autoload.txt"
+local fsOK = (writefile and readfile and isfile and makefolder and delfile) and true or false
+
+local SaveBox = SettingsTab:AddLeftGroupbox("Salvar / Autoload", "save")
+local SaveStatus = SaveBox:AddLabel("...", true)
+
+local function hasSave() return fsOK and isfile(CFG_FILE) end
+local function hasAuto() return fsOK and isfile(AUTO_FILE) end
+
+local function refreshSaveStatus()
+    if not fsOK then
+        SaveStatus:SetText("Seu executor nao suporta arquivos (writefile).")
+        return
+    end
+    SaveStatus:SetText(string.format(
+        "Save: <b>%s</b>\nAutoload: <b>%s</b>",
+        hasSave() and "existe" or "nenhum",
+        hasAuto() and "ligado" or "desligado"
+    ))
+end
+
+local function collectConfig()
+    local data = {}
+    for name, t in pairs(Toggles) do data[name] = t.Value end
+    for name, o in pairs(Options) do
+        if o.Type == "Slider" or o.Type == "Input" then data[name] = o.Value end
+    end
+    return data
+end
+
+local function saveConfig()
+    if not fsOK then return false end
+    if not isfolder or not isfolder(FOLDER) then makefolder(FOLDER) end
+    writefile(CFG_FILE, HttpService:JSONEncode(collectConfig()))
+    return true
+end
+
+local function loadConfig()
+    if not hasSave() then return false end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(CFG_FILE)) end)
+    if not ok or type(data) ~= "table" then return false end
+
+    -- aplica tudo, deixando o toggle principal por ultimo
+    for name, v in pairs(data) do
+        if name ~= "GoToX" then
+            local o = Options[name] or Toggles[name]
+            if o and o.SetValue then pcall(function() o:SetValue(v) end) end
+        end
+    end
+    if data.GoToX ~= nil and Toggles.GoToX then
+        pcall(function() Toggles.GoToX:SetValue(data.GoToX) end)
+    end
+    return true
+end
+
+SaveBox:AddButton({
+    Text = "Salvar configuracao",
+    Func = function()
+        if saveConfig() then
+            Library:Notify("Configuracao salva.", 3)
+        else
+            Library:Notify("Executor sem suporte a arquivos.", 4)
+        end
+        refreshSaveStatus()
+    end,
+})
+
+SaveBox:AddButton({
+    Text = "Usar save atual como Autoload",
+    Func = function()
+        if not fsOK then Library:Notify("Executor sem suporte a arquivos.", 4) return end
+        if not hasSave() then saveConfig() end
+        writefile(AUTO_FILE, "1")
+        Library:Notify("Autoload ligado: o save sera carregado ao executar.", 4)
+        refreshSaveStatus()
+    end,
+})
+
+SaveBox:AddButton({
+    Text = "Excluir save e autoload",
+    DoubleClick = true,
+    Func = function()
+        if not fsOK then return end
+        if isfile(CFG_FILE) then delfile(CFG_FILE) end
+        if isfile(AUTO_FILE) then delfile(AUTO_FILE) end
+        Library:Notify("Save e autoload excluidos.", 3)
+        refreshSaveStatus()
+    end,
+})
+
+refreshSaveStatus()
+
+----------------------------------------------------------------
+-- SERVER HOP
+----------------------------------------------------------------
+local function fetchServers()
+    local ids, cursor = {}, nil
+    for _ = 1, 3 do
+        local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true")
+            :format(game.PlaceId)
+        if cursor then url = url .. "&cursor=" .. cursor end
+
+        local ok, res = pcall(function()
+            return HttpService:JSONDecode(game:HttpGet(url))
+        end)
+        if not ok or type(res) ~= "table" or type(res.data) ~= "table" then break end
+
+        for _, s in ipairs(res.data) do
+            if s.id ~= game.JobId and s.playing and s.maxPlayers and s.playing < s.maxPlayers - 1 then
+                table.insert(ids, s.id)
+            end
+        end
+
+        cursor = res.nextPageCursor
+        if not cursor then break end
+    end
+    return ids
+end
+
+serverHop = function()
+    if State.Hopping then return end
+    State.Hopping = true
+
+    if State.Tween then State.Tween:Cancel() end
+    State.Flying = false
+    State.Lock = nil
+    State.Status = "Server hop: buscando servidor..."
+
+    -- salva a config e liga o autoload pra continuar sozinho no novo servidor
+    if fsOK then
+        pcall(function()
+            saveConfig()
+            writefile(AUTO_FILE, "1")
+        end)
+    end
+
+    -- re-executa o script sozinho no novo servidor (usa a copia salva em RedXHub/script.lua)
+    if queue_on_teleport then
+        local code
+        if isfile and isfile("RedXHub/script.lua") then
+            code = 'if not game:IsLoaded() then game.Loaded:Wait() end loadstring(readfile("RedXHub/script.lua"))()'
+        else
+            local url = Options.ScriptURL and Options.ScriptURL.Value or ""
+            if url ~= "" then
+                code = ('if not game:IsLoaded() then game.Loaded:Wait() end loadstring(game:HttpGet("%s"))()'):format(url)
+            end
+        end
+        if code then pcall(queue_on_teleport, code) end
+    end
+
+    for attempt = 1, 6 do
+        if not State.Running then break end
+
+        local all = fetchServers()
+        local fresh = {}
+        for _, id in ipairs(all) do
+            if not State.TriedServers[id] then fresh[#fresh + 1] = id end
+        end
+        if #fresh == 0 then fresh = all end
+
+        if #fresh > 0 then
+            local id = fresh[math.random(#fresh)]
+            State.TriedServers[id] = true
+            State.Status = ("Server hop: tentativa %d/6..."):format(attempt)
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, id, Plr)
+            end)
+            task.wait(10) -- se o teleporte funcionar, o script some aqui
+        else
+            State.Status = "Server hop: nenhum servidor achado, tentando de novo..."
+            task.wait(3)
+        end
+    end
+
+    -- ultimo recurso: teleporte normal pro mesmo jogo (servidor aleatorio)
+    if State.Running then
+        State.Status = "Server hop: teleporte padrao..."
+        pcall(function() TeleportService:Teleport(game.PlaceId, Plr) end)
+        task.wait(10)
+    end
+
+    State.Hopping = false
+    State.Status = "Server hop falhou. Tentando de novo..."
+end
+
+----------------------------------------------------------------
+-- STATUS + AUTOLOAD
+----------------------------------------------------------------
+task.spawn(function()
+    while State.Running and not Library.Unloaded do
+        task.wait(0.4)
+        StatusLabel:SetText("Status: " .. State.Status)
+    end
+end)
+
+Library.ToggleKeybind = Enum.KeyCode.RightControl
+Library:Notify("Red X Hub v5 carregado. RightCtrl abre/fecha.", 4)
+
+if hasAuto() and hasSave() then
+    task.delay(1, function()
+        if loadConfig() then
+            Library:Notify("Autoload: configuracao carregada.", 4)
+        end
+    end)
+end
+
+]==]
+
+pcall(function()
+    if writefile then
+        if makefolder and isfolder and not isfolder("RedXHub") then makefolder("RedXHub") end
+        writefile("RedXHub/script.lua", SRC)
+    end
+end)
+
+loadstring(SRC)()
